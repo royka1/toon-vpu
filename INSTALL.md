@@ -68,10 +68,12 @@ cd prebuilt && sha256sum -c SHA256SUMS
 Expected:
 
 ```
-499b6e4d62b1300cfb1acb0f005628ea8f0ac668d9cae16a28ce7f275d82e800  mxc_vpu.ko
-64ff0073b55c8f2f65ad573a9b4221145cc33991559b2f63d1168f7b2cc5f933  libvpu.a
-989a55b9922be131002cb11037aab4dc95e836b99767415172c417ce2725e75d  vpu_stream
-511b53add846a12c4e6b7c71ff893162f3d044eb17f1471c177e17885c7186aa  vpu_dec_fb3
+f30d3a2069b59670c08f64e68363f36c1f32a1a222de3d7e018d6c036acad858  ./firmware/vpu_fw_imx27_TO1.bin
+48861403fb5246e1f5dc48d01ea601a2e06b7857b10fcb8612ff9b470470786b  ./firmware/vpu_fw_imx27_TO2.bin
+64ff0073b55c8f2f65ad573a9b4221145cc33991559b2f63d1168f7b2cc5f933  ./libvpu.a
+499b6e4d62b1300cfb1acb0f005628ea8f0ac668d9cae16a28ce7f275d82e800  ./mxc_vpu.ko
+511b53add846a12c4e6b7c71ff893162f3d044eb17f1471c177e17885c7186aa  ./vpu_dec_fb3
+989a55b9922be131002cb11037aab4dc95e836b99767415172c417ce2725e75d  ./vpu_stream
 ```
 
 ---
@@ -81,26 +83,31 @@ Expected:
 All steps assume you can `ssh root@<toon>` and that the Toon is rooted.
 `<toon>` is whatever address resolves for you (`toon`, an IP, ...).
 
-### 1. VPU firmware (Freescale blob — not in this repo)
+### 1. VPU firmware (bundled in `prebuilt/firmware/`)
 
-The VPU needs a Freescale firmware blob at `/lib/firmware/vpu/`:
+The VPU needs a Freescale firmware blob at `/lib/firmware/vpu/`. Both
+silicon revisions are bundled here:
 
 ```
-/lib/firmware/vpu/vpu_fw_imx27_TO1.bin     (65552 bytes)
-/lib/firmware/vpu/vpu_fw_imx27_TO2.bin     (65552 bytes)  ← required (Toon is TO2)
+prebuilt/firmware/vpu_fw_imx27_TO1.bin     (65552 bytes — TO1 silicon)
+prebuilt/firmware/vpu_fw_imx27_TO2.bin     (65552 bytes — TO2 silicon; the Toon)
 ```
 
-These ship with the i.MX27 Freescale BSP (`firmware-imx` package on
-Yocto / OE, or `linux-firmware-imx` in many vendor trees). They are NOT
-redistributable through this repo. The Toon usually already has them; if
-yours doesn't, pull them from any i.MX27 BSP firmware tarball.
+See [`prebuilt/firmware/README.md`](prebuilt/firmware/README.md) for the
+provenance and license (Freescale `firmware-imx` EULA — redistributable
+for use on i.MX hardware).
 
-Sanity check on the Toon:
+Copy them onto the Toon:
 
 ```sh
+ssh root@<toon> 'mkdir -p /lib/firmware/vpu'
+scp prebuilt/firmware/vpu_fw_imx27_TO{1,2}.bin root@<toon>:/lib/firmware/vpu/
 ssh root@<toon> 'ls -la /lib/firmware/vpu/'
 # expect both .bin files, 65552 bytes each
 ```
+
+(Most Toons already have these from the factory image; copying is harmless
+since the SHA256s match.)
 
 ### 2. Back up the existing module
 

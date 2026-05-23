@@ -220,6 +220,7 @@ ssh root@<toon> '
 | `vpu_Init` fails with "firmware open failed" | Firmware blob missing at `/lib/firmware/vpu/vpu_fw_imx27_TO2.bin`. |
 | `vpu_stream` aborts after a few minutes | You're using a stale `mxc_vpu.ko` from before the futex / share-mem fix. Reinstall from `prebuilt/`. |
 | Stream connects but the picture is wrong colors | Sender isn't doing `in_range=pc:out_range=tv` + `colormatrix=bt709:bt601` — use the scripts in `scripts/` as-is. |
+| Picture is half-width and tinted weirdly after a reboot | `fb0` came back at 32bpp (the Toon's Qt-gui prefers it; vpu_stream's startup log will say `fb0: 800x480 32bpp …`). The current `prebuilt/vpu_stream` widens RGB565 → the panel's BGR666 layout in the blit and handles this. If you're seeing this, you're on an older binary — reinstall `prebuilt/vpu_stream`. |
 
 ---
 

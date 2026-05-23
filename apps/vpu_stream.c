@@ -105,6 +105,8 @@ int main(int argc, char **argv)
     int lsock, one = 1, i;
     struct sockaddr_in addr;
     int fb_fd, fb_stride, fb_w, fb_h, fb_bpp;
+    int fb_r_off = 11, fb_g_off = 5, fb_b_off = 0;   /* RGB565 defaults */
+    int fb_r_len = 5, fb_g_len = 6, fb_b_len = 5;
     struct fb_var_screeninfo vinfo;
     unsigned char *fb_map;
     DecOpenParam op; DecInitialInfo ii; DecBufInfo binfo;
@@ -128,6 +130,22 @@ int main(int argc, char **argv)
     fb_w = vinfo.xres; fb_h = vinfo.yres; fb_bpp = vinfo.bits_per_pixel;
     fb_stride = fb_w * (fb_bpp / 8);
     fb_map = mmap(NULL, fb_stride * fb_h, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+    /* fb may be 16 (RGB565) or 32 (xRGB/BGRx) — Qt-gui flips this across
+     * reboots. eMMA PrP always outputs RGB565; for 32bpp targets we widen
+     * per-row in the blit, using the kernel-reported channel offsets so
+     * any byte order works. */
+    if (fb_bpp == 32) {
+        fb_r_off = vinfo.red.offset;   fb_r_len = vinfo.red.length;
+        fb_g_off = vinfo.green.offset; fb_g_len = vinfo.green.length;
+        fb_b_off = vinfo.blue.offset;  fb_b_len = vinfo.blue.length;
+    }
+    printf("fb0: %dx%d %dbpp R@%d/%d G@%d/%d B@%d/%d stride=%d\n",
+           fb_w, fb_h, fb_bpp, fb_r_off, fb_r_len, fb_g_off, fb_g_len,
+           fb_b_off, fb_b_len, fb_stride);
+    if (fb_bpp != 16 && fb_bpp != 32) {
+        fprintf(stderr, "fb0 bpp %d not supported (need 16 or 32)\n", fb_bpp);
+        return 1;
+    }
 
     if (vpu_Init(NULL) != RETCODE_SUCCESS) { fprintf(stderr, "vpu_Init fail\n"); return 1; }
     bs.size = STREAM_BUF_SIZE;
@@ -218,9 +236,40 @@ int main(int argc, char **argv)
                 c.src_stride = stride; c.dst_rgb = rgbmem.phy_addr;
                 c.dst_w = ii.picWidth; c.dst_h = ah; c.dst_stride = ii.picWidth * 2;
                 ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &c);
-                for (i = 0; i < (int)ii.picHeight; i++)
-                    memcpy(fb_map + off_y * fb_stride + off_x * (fb_bpp / 8) + i * fb_stride,
-                           (unsigned char *)rgbmem.virt_uaddr + i * blit_bytes, blit_bytes);
+                if (fb_bpp == 16) {
+                    /* RGB565 in, RGB565 out — straight memcpy per row. */
+                    for (i = 0; i < (int)ii.picHeight; i++)
+                        memcpy(fb_map + off_y * fb_stride + off_x * 2 + i * fb_stride,
+                               (unsigned char *)rgbmem.virt_uaddr + i * blit_bytes,
+                               blit_bytes);
+                } else {
+                    /* 32bpp target: widen RGB565 -> packed 8:8:8 using the
+                     * kernel-reported channel offsets so this works on
+                     * xRGB, BGRx, ARGB, ... whatever the panel driver
+                     * chose this boot. */
+                    int row, col;
+                    int ro = fb_r_off, go = fb_g_off, bo = fb_b_off;
+                    int rs = 8 - fb_r_len, gs = 8 - fb_g_len, bs = 8 - fb_b_len;
+                    for (row = 0; row < (int)ii.picHeight; row++) {
+                        unsigned short *src = (unsigned short *)
+                            ((unsigned char *)rgbmem.virt_uaddr + row * blit_bytes);
+                        unsigned int *dst = (unsigned int *)
+                            (fb_map + (off_y + row) * fb_stride + off_x * 4);
+                        for (col = 0; col < (int)ii.picWidth; col++) {
+                            unsigned short p = src[col];
+                            unsigned int r = ((p >> 11) & 0x1F) << 3;
+                            unsigned int g = ((p >>  5) & 0x3F) << 2;
+                            unsigned int b = ( p        & 0x1F) << 3;
+                            /* replicate top bits into low ones so 0x1F -> 0xFF */
+                            r |= r >> 5;  g |= g >> 6;  b |= b >> 5;
+                            /* narrow each channel to its field width
+                             * (6 on the Toon's BGR666-padded panel,
+                             * 8 on a normal ARGB32 fb -- shift = 0). */
+                            r >>= rs;  g >>= gs;  b >>= bs;
+                            dst[col] = (r << ro) | (g << go) | (b << bo);
+                        }
+                    }
+                }
                 vpu_DecClrDispFlag(h, idx);
                 frames++;
             }

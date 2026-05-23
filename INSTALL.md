@@ -97,7 +97,12 @@ See [`prebuilt/firmware/README.md`](prebuilt/firmware/README.md) for the
 provenance and license (Freescale `firmware-imx` EULA — redistributable
 for use on i.MX hardware).
 
-Copy them onto the Toon:
+> **A stock Toon has neither this directory nor the firmware** — Quby
+> stripped the entire VPU stack (driver, firmware, headers) out of their
+> BSP, so a factory device has no `/lib/firmware/vpu/` and no
+> `mxc_vpu.ko`. You're putting both there now.
+
+Copy the firmware onto the Toon:
 
 ```sh
 ssh root@<toon> 'mkdir -p /lib/firmware/vpu'
@@ -106,25 +111,15 @@ ssh root@<toon> 'ls -la /lib/firmware/vpu/'
 # expect both .bin files, 65552 bytes each
 ```
 
-(Most Toons already have these from the factory image; copying is harmless
-since the SHA256s match.)
+### 2. Copy the prebuilt files onto the Toon
 
-### 2. Back up the existing module
-
-There is usually a stock (broken) `mxc_vpu.ko` already in place. Back it
-up so you can revert:
+There is no existing `mxc_vpu.ko` on a stock Toon — Quby's BSP omits the
+whole `drivers/mxc/vpu/` tree, so the kernel directory below probably
+doesn't even exist yet:
 
 ```sh
-ssh root@<toon> '
-    cd /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/
-    [ -f mxc_vpu.ko ] && cp mxc_vpu.ko mxc_vpu.ko.orig
-'
-```
-
-### 3. Copy the prebuilt files onto the Toon
-
-```sh
-# kernel module
+# kernel module (mkdir -p because the target dir doesn't exist on stock)
+ssh root@<toon> 'mkdir -p /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/'
 scp prebuilt/mxc_vpu.ko \
     root@<toon>:/lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/mxc_vpu.ko
 
@@ -138,7 +133,7 @@ scp scripts/toon-doorbell.sh root@<toon>:/root/vpu/doorbell.sh
 ssh root@<toon> 'chmod +x /root/vpu/vpu_stream /root/vpu/vpu_dec_fb3 /root/vpu/doorbell.sh'
 ```
 
-### 4. Load the module
+### 3. Load the module
 
 The Toon's installer typically autoloads modules under `/lib/modules/$(uname -r)/`
 once `depmod` knows about them:
@@ -161,7 +156,7 @@ mxc_vpu: eMMA PrP ready
 mxc_vpu: DMA pool reserved 12 MB
 ```
 
-### 5. Create the device node (no udev on the Toon)
+### 4. Create the device node (no udev on the Toon)
 
 `toon-doorbell.sh` does this automatically, but to verify by hand:
 
@@ -174,7 +169,7 @@ ssh root@<toon> '
 '
 ```
 
-### 6. Run the doorbell pipeline
+### 5. Run the doorbell pipeline
 
 On the Toon:
 
@@ -200,16 +195,19 @@ Within a few seconds the camera feed should appear on the Toon display.
 
 ## Reverting
 
+The stock Toon doesn't have any VPU bits to revert to — just unload the
+module, drop the device node, and remove the files you copied:
+
 ```sh
 ssh root@<toon> '
     /sbin/rmmod mxc_vpu 2>/dev/null
-    cd /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/
-    [ -f mxc_vpu.ko.orig ] && mv mxc_vpu.ko.orig mxc_vpu.ko
+    rm -f /dev/mxc_vpu
+    rm -rf /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/
+    rm -rf /lib/firmware/vpu/
+    rm -rf /root/vpu/
     /sbin/depmod -a
 '
 ```
-
-Reboot the Toon and you're back to stock.
 
 ---
 

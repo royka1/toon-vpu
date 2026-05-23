@@ -20,10 +20,13 @@ unchanged for over a decade by:
 
 - The official Yocto / OpenEmbedded `meta-freescale` layer
   (`recipes-bsp/firmware-imx/`).
-- The OpenEmbedded recipe that originally shipped on the Toon itself —
-  the copy in this directory is bit-identical to the one already present
-  on every rooted Toon at `/lib/firmware/vpu/`.
 - Various i.MX27 community projects and downstream distributions.
+
+> **They are NOT shipped on a stock Toon.** Quby cut the entire VPU
+> stack — driver, headers, firmware — out of their fork of the BSP, so a
+> factory Toon has neither these blobs nor any way for the kernel to use
+> them. They are reinstated here only because this project re-enables the
+> hardware.
 
 ## License
 

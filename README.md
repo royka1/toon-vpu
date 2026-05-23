@@ -4,11 +4,16 @@ Hardware-accelerated video decode on a rooted **Toon thermostat** (Quby/Eneco) �
 the i.MX27 Codadx6 VPU brought back to life on a kernel it was never meant to
 run on, then wired up as a live front-door camera display.
 
-The Toon ships with a 2.6.36-R10-h28 kernel for which Quby never released VPU
-sources. This repo backports the Freescale 2.6.35 BSP Codadx6 driver into that
-tree, adds kernel-side workarounds for what the platform takes away (no udev,
-no userspace peripheral access, no `vpu_clk` on this board), and ships the
-userspace pieces needed to actually display a stream.
+The i.MX27 SoC inside the Toon has a perfectly capable Chips&Media Codadx6
+VPU and a Freescale eMMA pre-processor, but **Quby stripped the entire VPU
+stack — driver, headers, firmware — out of their fork of the BSP**, so a
+factory Toon can't use either block. This repo puts the hardware back in
+service: it backports the Freescale 2.6.35 BSP Codadx6 driver onto the
+Toon's 2.6.36-R10-h28 kernel, adds the kernel-side workarounds the
+platform needs (no udev, no userspace peripheral access, no `vpu_clk`
+binding on this board, no contiguous DMA at runtime), bundles the
+Freescale firmware blobs the driver loads at init, and ships the
+userspace pieces to actually display a stream.
 
 End-to-end pipeline:
 

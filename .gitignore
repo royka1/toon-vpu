@@ -1,0 +1,22 @@
+# build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.ko
+*.mod.c
+*.mod.o
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# test binaries
+vpu_test
+vpu_stream
+vpu_dec_fb3
+
+# editor cruft
+*~
+*.swp
+.DS_Store

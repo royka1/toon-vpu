@@ -1261,6 +1261,25 @@ static struct platform_driver mxcvpu_driver = {
 	.resume = vpu_resume,
 };
 
+/* Toon ships with HCLK (= AHB = VPU clock) at ~103 MHz (CSCR.AHB_PDF = 2,
+ * divide-by-3 of mpll_main2 = 2*MPLL/3 = 310 MHz). The i.MX27 spec max is
+ * 133 MHz, so the VPU is at ~77 % of spec by default.
+ *
+ * Setting hclk_max=1 at insmod time programs CSCR.AHB_PDF = 1 (divide-by-2)
+ * which puts HCLK at ~155 MHz -- a bit over spec, but in practice the VPU,
+ * eMMA and SDRAM controller all run fine at this rate on Toon silicon
+ * (we tested this from the same module). NAND/LCDC also bump by ~50 %;
+ * we have not seen corruption but it is not Freescale-blessed.
+ *
+ * 2.6.36's clk_set_rate(ahb_clk, ...) is a no-op on this BSP (ahb_clk has
+ * no .set_rate callback, only .get_rate), so a direct CSCR write is the
+ * only path. Reverts on reboot (no persistent change). */
+static int hclk_max = 0;
+module_param(hclk_max, int, 0644);
+MODULE_PARM_DESC(hclk_max,
+    "If 1, bump HCLK/VPU from ~103 MHz to ~155 MHz at module load "
+    "(CSCR.AHB_PDF 2->1). Slightly above i.MX27 spec; revert via reboot.");
+
 static int __init vpu_init(void)
 {
 	int err;
@@ -1288,6 +1307,99 @@ static int __init vpu_init(void)
 		u32 cid = __raw_readl(ccm_base + 0x800);
 		printk(KERN_INFO "vpu: SYSCTRL CHIP_ID=0x%08x part=0x%04x silicon_rev=%d\n",
 		       cid, (cid >> 12) & 0xFFFF, cid >> 28);
+
+		/* CCM clock dump — answers "is the VPU underclocked?" without
+		 * needing /dev/mem or any userspace peripheral access.
+		 * VPU on i.MX27 runs on HCLK (AHB); HCLK = SPLL / (BCLKDIV+1).
+		 * CKIH = 26 MHz external crystal.  MPCTL0 / SPCTL0 layout:
+		 *   bits  0..9  MFN  (signed via bit 29)
+		 *   bits 10..13 MFI
+		 *   bits 16..25 MFD
+		 *   bits 26..29 PD
+		 * PLL = 2 * CKIH * (MFI + MFN/(MFD+1)) / (PD+1) when MFN>=0. */
+		{
+			/* CCM clock dump — answers "is the VPU underclocked?".
+			 * VPU runs on AHB (HCLK). For i.MX27 TO2+:
+			 *   ahb_pdf  = (CSCR >> 8)  & 0x3
+			 *   mpll_main2 = (2 * MPLL) / 3    (the standard ARM path)
+			 *   ahb_clk  = mpll_main2 / (ahb_pdf + 1)
+			 * ARM source is selected by CSCR bit 15 (ARM_SRC): 0 -> main2
+			 * (= 2*MPLL/3), 1 -> main1 (= MPLL). cpu_pdf = (CSCR>>12)&0x3.
+			 * PLL formula is the standard mxc_decode_pll from
+			 * arch/arm/plat-mxc/clock.c. CKIH = 26 MHz crystal. */
+			u32 mpctl0 = __raw_readl(ccm_base + 0x04);
+			u32 spctl0 = __raw_readl(ccm_base + 0x0C);
+			u32 cscr   = __raw_readl(ccm_base + 0x00);
+			u32 pcdr0  = __raw_readl(ccm_base + 0x18);
+			u32 pcdr1  = __raw_readl(ccm_base + 0x1C);
+			u32 pccr0  = __raw_readl(ccm_base + 0x20);
+			u32 pccr1  = __raw_readl(ccm_base + 0x24);
+			u32 ckih_khz = 26000;
+			int i;
+			u32 plls_khz[2] = {0, 0};
+			for (i = 0; i < 2; i++) {
+				u32 r   = (i == 0) ? mpctl0 : spctl0;
+				int mfi = (r >> 10) & 0xF;
+				int mfn =  r        & 0x3FF;
+				int mfd = (r >> 16) & 0x3FF;
+				int pd  = (r >> 26) & 0xF;
+				int mfn_abs = mfn;
+				u32 freq = 2 * ckih_khz / (pd + 1);
+				if (mfi < 5) mfi = 5;
+				if (mfn >= 0x200) mfn_abs = 0x400 - mfn;
+				/* PLL = freq * mfi + (freq * mfn_abs) / (mfd+1) */
+				{
+					u32 frac = (freq * (u32)mfn_abs) / (mfd + 1);
+					plls_khz[i] = freq * (u32)mfi +
+					              (mfn >= 0x200 ? -frac : frac);
+				}
+			}
+			{
+				u32 mpll_khz  = plls_khz[0];
+				u32 spll_khz  = plls_khz[1];
+				/* main paths: main1 = 2*MPLL/2 = MPLL, main2 = 2*MPLL/3 */
+				u32 main1_khz = mpll_khz;
+				u32 main2_khz = (2u * mpll_khz) / 3u;
+				u32 cpu_pdf   = (cscr >> 12) & 0x3;
+				u32 ahb_pdf   = (cscr >> 8)  & 0x3;
+				u32 arm_src   = (cscr >> 15) & 1;
+				u32 arm_parent = arm_src ? main1_khz : main2_khz;
+				u32 arm_khz   = arm_parent / (cpu_pdf + 1);
+				u32 ahb_khz   = main2_khz  / (ahb_pdf + 1);
+				printk(KERN_INFO "vpu: CCM CSCR=0x%08x MPCTL0=0x%08x SPCTL0=0x%08x\n",
+				       cscr, mpctl0, spctl0);
+				printk(KERN_INFO "vpu: CCM PCDR0=0x%08x PCDR1=0x%08x PCCR0=0x%08x PCCR1=0x%08x\n",
+				       pcdr0, pcdr1, pccr0, pccr1);
+				printk(KERN_INFO "vpu: PLLs MPLL=%u kHz SPLL=%u kHz main1=%u main2=%u\n",
+				       mpll_khz, spll_khz, main1_khz, main2_khz);
+				printk(KERN_INFO "vpu: clocks ARM=%u kHz HCLK/VPU=%u kHz "
+				       "(arm_src=%s cpu_pdf=%u ahb_pdf=%u)\n",
+				       arm_khz, ahb_khz,
+				       arm_src ? "main1" : "main2", cpu_pdf, ahb_pdf);
+				printk(KERN_INFO "vpu: spec max HCLK/VPU = 133 MHz; we are at %u%% of spec\n",
+				       (ahb_khz * 100u) / 133000u);
+			}
+
+			/* hclk_max=1: program AHB_PDF = 1 so HCLK = main2/2 =
+			 * ~155 MHz. The write is a single CSCR update; the new
+			 * divider takes effect on the next AHB clock. Logs the
+			 * new state so you can confirm in dmesg. */
+			if (hclk_max && ((cscr >> 8) & 0x3) != 1) {
+				u32 new_cscr = (cscr & ~(0x3u << 8)) | (0x1u << 8);
+				printk(KERN_WARNING "vpu: bumping HCLK: CSCR 0x%08x -> 0x%08x "
+				       "(AHB_PDF %u -> 1)\n",
+				       cscr, new_cscr, (cscr >> 8) & 0x3);
+				__raw_writel(new_cscr, ccm_base + 0x00);
+				/* re-read so the user can see it stuck */
+				new_cscr = __raw_readl(ccm_base + 0x00);
+				{
+					u32 main2 = (2u * plls_khz[0]) / 3u;
+					u32 new_ahb = main2 / (((new_cscr >> 8) & 0x3) + 1);
+					printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
+					       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
+				}
+			}
+		}
 	}
 
 	vpu_major = register_chrdev(0, "mxc_vpu", &vpu_fops);

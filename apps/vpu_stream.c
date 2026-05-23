@@ -22,8 +22,16 @@
 #include <netinet/tcp.h>
 #include <sys/resource.h>
 #include <linux/fb.h>
+#include <sys/time.h>
 #include "vpu_lib.h"
 #include "vpu_io.h"
+
+static long now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000L + tv.tv_usec / 1000L;
+}
 
 #define STREAM_BUF_SIZE   (1 * 1024 * 1024)
 #define ALIGN16(x)        (((x) + 15) & ~15)
@@ -114,6 +122,7 @@ int main(int argc, char **argv)
     FrameBuffer fb[32];
     int fbcount = 0, stride = 0, ah = 0, ysize = 0, csize = 0, mvsize = 0;
     int prp_fd, fb_alloced = 0, blit_bytes = 0;
+    unsigned int *row_scratch = NULL;   /* one row of 32bpp, cached DRAM */
 
     signal(SIGPIPE, SIG_IGN);
     setpriority(PRIO_PROCESS, 0, 10);
@@ -203,6 +212,10 @@ int main(int argc, char **argv)
             }
             rgbmem.size = ii.picWidth * ah * 2;
             if (IOGetPhyMem(&rgbmem) || IOGetVirtMem(&rgbmem) <= 0) { fprintf(stderr, "rgb\n"); return 1; }
+            if (fb_bpp == 32) {
+                row_scratch = malloc(ii.picWidth * 4);
+                if (!row_scratch) { fprintf(stderr, "row_scratch\n"); return 1; }
+            }
             fb_alloced = 1;
         }
         memset(&binfo, 0, sizeof(binfo));
@@ -212,12 +225,16 @@ int main(int argc, char **argv)
         memset(fb_map, 0, fb_stride * fb_h);
         printf("streaming...\n"); fflush(stdout);
 
+        long t_window = now_ms(), f_window = 0;
+        long ms_dec = 0, ms_prp = 0, ms_blit = 0;
+
         /* decode/display loop */
         for (;;) {
             DecParam dp; DecOutputInfo oi;
             /* When falling behind (socket buffer > 32KB), discard stale
              * data and re-sync at the most recent MPEG start code so the
              * delay doesn't grow unbounded. */
+            long t0 = now_ms();
             feed_skip_to_latest(h);
             if (feed(h, 0) == 0) break;
             memset(&dp, 0, sizeof(dp));
@@ -229,6 +246,7 @@ int main(int argc, char **argv)
             }
             memset(&oi, 0, sizeof(oi));
             if (vpu_DecGetOutputInfo(h, &oi) != RETCODE_SUCCESS) break;
+            long t1 = now_ms();
             if (oi.indexFrameDisplay >= 0 && oi.indexFrameDisplay < fbcount) {
                 struct vpu_prp_convert c;
                 int idx = oi.indexFrameDisplay;
@@ -236,6 +254,7 @@ int main(int argc, char **argv)
                 c.src_stride = stride; c.dst_rgb = rgbmem.phy_addr;
                 c.dst_w = ii.picWidth; c.dst_h = ah; c.dst_stride = ii.picWidth * 2;
                 ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &c);
+                long t2 = now_ms();
                 if (fb_bpp == 16) {
                     /* RGB565 in, RGB565 out — straight memcpy per row. */
                     for (i = 0; i < (int)ii.picHeight; i++)
@@ -246,32 +265,43 @@ int main(int argc, char **argv)
                     /* 32bpp target: widen RGB565 -> packed 8:8:8 using the
                      * kernel-reported channel offsets so this works on
                      * xRGB, BGRx, ARGB, ... whatever the panel driver
-                     * chose this boot. */
+                     * chose this boot. We fill a cached row buffer, then
+                     * burst-memcpy it to the uncached fb -- per-pixel
+                     * writes straight to fb mem serialize one bus
+                     * transaction per word, which kills the frame rate. */
                     int row, col;
                     int ro = fb_r_off, go = fb_g_off, bo = fb_b_off;
                     int rs = 8 - fb_r_len, gs = 8 - fb_g_len, bs = 8 - fb_b_len;
+                    int row_bytes = ii.picWidth * 4;
                     for (row = 0; row < (int)ii.picHeight; row++) {
                         unsigned short *src = (unsigned short *)
                             ((unsigned char *)rgbmem.virt_uaddr + row * blit_bytes);
-                        unsigned int *dst = (unsigned int *)
-                            (fb_map + (off_y + row) * fb_stride + off_x * 4);
                         for (col = 0; col < (int)ii.picWidth; col++) {
                             unsigned short p = src[col];
                             unsigned int r = ((p >> 11) & 0x1F) << 3;
                             unsigned int g = ((p >>  5) & 0x3F) << 2;
                             unsigned int b = ( p        & 0x1F) << 3;
-                            /* replicate top bits into low ones so 0x1F -> 0xFF */
                             r |= r >> 5;  g |= g >> 6;  b |= b >> 5;
-                            /* narrow each channel to its field width
-                             * (6 on the Toon's BGR666-padded panel,
-                             * 8 on a normal ARGB32 fb -- shift = 0). */
                             r >>= rs;  g >>= gs;  b >>= bs;
-                            dst[col] = (r << ro) | (g << go) | (b << bo);
+                            row_scratch[col] = (r << ro) | (g << go) | (b << bo);
                         }
+                        memcpy(fb_map + (off_y + row) * fb_stride + off_x * 4,
+                               row_scratch, row_bytes);
                     }
                 }
                 vpu_DecClrDispFlag(h, idx);
-                frames++;
+                long t3 = now_ms();
+                ms_dec += (t1 - t0); ms_prp += (t2 - t1); ms_blit += (t3 - t2);
+                frames++; f_window++;
+                if (f_window >= 60) {
+                    long el = now_ms() - t_window;
+                    printf("%.1f fps over %ld frames | per-frame avg: dec %ldms prp %ldms blit %ldms\n",
+                           (f_window * 1000.0) / (el ? el : 1), f_window,
+                           ms_dec / f_window, ms_prp / f_window, ms_blit / f_window);
+                    fflush(stdout);
+                    t_window = now_ms(); f_window = 0;
+                    ms_dec = ms_prp = ms_blit = 0;
+                }
             }
             if (oi.indexFrameDecoded < 0 && oi.indexFrameDisplay < 0)
                 if (feed(h, 1) == 0) break;

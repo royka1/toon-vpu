@@ -73,7 +73,11 @@ static int feed_skip_to_latest(DecHandle h)
     int i, total, last_sc, off, chunk;
     int pending;
 
-    if (ioctl(sock, FIONREAD, &pending) < 0 || pending < 16384)
+    /* Drop the threshold (was 16k) so we re-sync to the latest frame on
+     * even a small backlog -- the goal here is *low* latency, not max fps.
+     * 2k is roughly one ~320x180 MPEG-4 P-frame at our bitrate, so any
+     * accumulated B/P-frame chain triggers a skip. */
+    if (ioctl(sock, FIONREAD, &pending) < 0 || pending < 2048)
         return 0;   /* not enough backlog to justify dropping frames */
 
     fcntl(sock, F_SETFL, O_NONBLOCK);
@@ -109,7 +113,23 @@ static int feed_skip_to_latest(DecHandle h)
 
 int main(int argc, char **argv)
 {
-    int port = argc > 1 ? atoi(argv[1]) : 5000;
+    int port = 5000;
+    /* Optional --rect X Y W H: render at (X,Y) sized W x H instead of the
+     * decoded-and-centred default. eMMA PrP does the resize bilinearly in
+     * hardware, so picking a smaller W/H is essentially free CPU-wise.
+     * Used by toonui to embed live video in a card on the home screen. */
+    int rect_x = -1, rect_y = -1, rect_w = -1, rect_h = -1;
+    for (int ai = 1; ai < argc; ai++) {
+        if (!strcmp(argv[ai], "--rect") && ai + 4 < argc) {
+            rect_x = atoi(argv[ai+1]); rect_y = atoi(argv[ai+2]);
+            rect_w = atoi(argv[ai+3]); rect_h = atoi(argv[ai+4]);
+            ai += 4;
+        } else if (argv[ai][0] != '-') {
+            port = atoi(argv[ai]);
+        }
+    }
+    int has_rect = (rect_w > 0 && rect_h > 0);
+
     int lsock, one = 1, i;
     struct sockaddr_in addr;
     int fb_fd, fb_stride, fb_w, fb_h, fb_bpp;
@@ -171,6 +191,13 @@ int main(int argc, char **argv)
         sock = accept(lsock, NULL, NULL);
         if (sock < 0) continue;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        /* Cap the kernel's TCP receive buffer so it can't hoard frames on
+         * us. Linux's default is ~87 KB which holds several seconds of
+         * MPEG-4 at our bitrate. With ~32 KB the kernel itself bounds the
+         * latency to a fraction of a second; feed_skip_to_latest mops up
+         * the rest. */
+        int rcvbuf = 32 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
         printf("client connected\n"); fflush(stdout);
 
         memset(&op, 0, sizeof(op));
@@ -192,15 +219,53 @@ int main(int argc, char **argv)
         printf("Video: %dx%d minFB=%d\n", ii.picWidth, ii.picHeight, ii.minFrameBufferCount);
         fflush(stdout);
 
-        off_x = (fb_w - (int)ii.picWidth) / 2;  if (off_x < 0) off_x = 0;
-        off_y = (fb_h - (int)ii.picHeight) / 2; if (off_y < 0) off_y = 0;
+        /* Output rect (where the video lands, and how big the PrP should
+         * resize each decoded frame to). The eMMA PrP only *downsamples*
+         * cleanly; asking it to upscale produces garbage (the classic
+         * "tiled tiny copies of the source on a black background" pattern).
+         * So in rect-mode cap the dst to the actual decoded source dims —
+         * a requested 640x480 against a 640x360 source becomes 640x360
+         * at the requested (rect_x, rect_y). Remember the original rect
+         * so we can blackfill the rest of the cutout once, otherwise the
+         * UI pixels that were there before vpu_stream started show through. */
+        int orig_w = has_rect ? rect_w : 0;
+        int orig_h = has_rect ? rect_h : 0;
+        int out_w = has_rect ? rect_w : (int)ii.picWidth;
+        int out_h = has_rect ? rect_h : (int)ii.picHeight;
+        if (has_rect) {
+            if (out_w > (int)ii.picWidth)  out_w = ii.picWidth;
+            if (out_h > (int)ii.picHeight) out_h = ii.picHeight;
+        }
+        off_x = has_rect ? rect_x : (fb_w  - out_w) / 2;
+        off_y = has_rect ? rect_y : (fb_h  - out_h) / 2;
+        if (off_x < 0) off_x = 0;
+        if (off_y < 0) off_y = 0;
+
+        /* One-time blackfill of the *original* cutout area so any UI pixels
+         * left behind when the cutout was set don't show through where the
+         * (possibly smaller) video doesn't reach. Only runs when the rect
+         * was actually clamped. */
+        if (has_rect && (out_w < orig_w || out_h < orig_h)) {
+            int bpp = fb_bpp / 8;
+            for (int yy = 0; yy < orig_h && (rect_y + yy) < fb_h; yy++) {
+                int w_clip = orig_w;
+                if (rect_x + w_clip > fb_w) w_clip = fb_w - rect_x;
+                if (w_clip > 0) {
+                    memset(fb_map + (rect_y + yy) * fb_stride + rect_x * bpp,
+                           0, (size_t)w_clip * bpp);
+                }
+            }
+            printf("[rect] requested %dx%d but source is %dx%d -> capping to %dx%d (no upscale)\n",
+                   orig_w, orig_h, ii.picWidth, ii.picHeight, out_w, out_h);
+            fflush(stdout);
+        }
 
         if (!fb_alloced) {       /* allocate frame + RGB buffers once (fixed res) */
             stride = ALIGN16(ii.picWidth); ah = ALIGN16(ii.picHeight);
             ysize = stride * ah; csize = (stride / 2) * (ah / 2);
             mvsize = ALIGN16(ii.picWidth / 16) * ALIGN16(ii.picHeight / 16) * 8;
             fbcount = ii.minFrameBufferCount + 2; if (fbcount > 32) fbcount = 32;
-            blit_bytes = ii.picWidth * 2;
+            blit_bytes = out_w * 2;
             for (i = 0; i < fbcount; i++) {
                 fbmem[i].size = ysize + 2 * csize + mvsize;
                 if (IOGetPhyMem(&fbmem[i])) { fprintf(stderr, "fb %d\n", i); return 1; }
@@ -210,13 +275,16 @@ int main(int argc, char **argv)
                 fb[i].bufCr = fb[i].bufCb + csize;
                 fb[i].bufMvCol = fb[i].bufCr + csize;
             }
-            rgbmem.size = ii.picWidth * ah * 2;
+            rgbmem.size = out_w * out_h * 2;
             if (IOGetPhyMem(&rgbmem) || IOGetVirtMem(&rgbmem) <= 0) { fprintf(stderr, "rgb\n"); return 1; }
             if (fb_bpp == 32) {
-                row_scratch = malloc(ii.picWidth * 4);
+                row_scratch = malloc(out_w * 4);
                 if (!row_scratch) { fprintf(stderr, "row_scratch\n"); return 1; }
             }
             fb_alloced = 1;
+            printf("output rect: %dx%d at (%d,%d)%s\n", out_w, out_h, off_x, off_y,
+                   has_rect ? " (hw-resized)" : " (1:1, centred)");
+            fflush(stdout);
         }
         memset(&binfo, 0, sizeof(binfo));
         if (vpu_DecRegisterFrameBuffer(h, fb, fbcount, stride, &binfo) != RETCODE_SUCCESS) {
@@ -250,14 +318,16 @@ int main(int argc, char **argv)
             if (oi.indexFrameDisplay >= 0 && oi.indexFrameDisplay < fbcount) {
                 struct vpu_prp_convert c;
                 int idx = oi.indexFrameDisplay;
+                /* PrP does YUV->RGB565 + (optional) bilinear resize from
+                 * src_w x src_h to dst_w x dst_h in one hardware pass. */
                 c.src_y = fbmem[idx].phy_addr; c.src_w = ii.picWidth; c.src_h = ah;
                 c.src_stride = stride; c.dst_rgb = rgbmem.phy_addr;
-                c.dst_w = ii.picWidth; c.dst_h = ah; c.dst_stride = ii.picWidth * 2;
+                c.dst_w = out_w; c.dst_h = out_h; c.dst_stride = out_w * 2;
                 ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &c);
                 long t2 = now_ms();
                 if (fb_bpp == 16) {
                     /* RGB565 in, RGB565 out — straight memcpy per row. */
-                    for (i = 0; i < (int)ii.picHeight; i++)
+                    for (i = 0; i < out_h; i++)
                         memcpy(fb_map + off_y * fb_stride + off_x * 2 + i * fb_stride,
                                (unsigned char *)rgbmem.virt_uaddr + i * blit_bytes,
                                blit_bytes);
@@ -272,11 +342,11 @@ int main(int argc, char **argv)
                     int row, col;
                     int ro = fb_r_off, go = fb_g_off, bo = fb_b_off;
                     int rs = 8 - fb_r_len, gs = 8 - fb_g_len, bs = 8 - fb_b_len;
-                    int row_bytes = ii.picWidth * 4;
-                    for (row = 0; row < (int)ii.picHeight; row++) {
+                    int row_bytes = out_w * 4;
+                    for (row = 0; row < out_h; row++) {
                         unsigned short *src = (unsigned short *)
                             ((unsigned char *)rgbmem.virt_uaddr + row * blit_bytes);
-                        for (col = 0; col < (int)ii.picWidth; col++) {
+                        for (col = 0; col < out_w; col++) {
                             unsigned short p = src[col];
                             unsigned int r = ((p >> 11) & 0x1F) << 3;
                             unsigned int g = ((p >>  5) & 0x3F) << 2;

@@ -1,9 +1,5 @@
-# build artifacts
+# build artifacts (the only checked-in binaries live under prebuilt/)
 *.o
-*.a
-*.so
-*.so.*
-*.ko
 *.mod.c
 *.mod.o
 *.cmd
@@ -11,10 +7,16 @@
 Module.symvers
 modules.order
 
-# test binaries
-vpu_test
-vpu_stream
-vpu_dec_fb3
+# build outputs that ARE checked in under prebuilt/ — ignore everywhere else
+/lib/*.a
+/lib/*.so
+/lib/*.so.*
+/kernel/*.ko
+
+# test binaries (only the curated ones in prebuilt/ are tracked)
+/apps/vpu_test
+/apps/vpu_stream
+/apps/vpu_dec_fb3
 
 # editor cruft
 *~

@@ -33,8 +33,15 @@ the result is blitted to `/dev/fb0`.
 | `lib/`        | Freescale `imx-lib/vpu` patched to talk to this driver (kernel-side register ioctls, no MX27 detection assumption, etc.). Builds `libvpu.a`. |
 | `apps/`       | Two userspace players linked against `libvpu.a`. |
 | `scripts/`    | Run-on-the-Toon + run-on-the-sender helpers. |
+| `prebuilt/`   | **Ready-to-install binaries for the Toon's exact kernel** (`2.6.36-R10-h28`, ARM `armv5tejl`): `mxc_vpu.ko`, `libvpu.a`, `vpu_stream`, `vpu_dec_fb3`, with `SHA256SUMS`. |
 | `reference/`  | Original Freescale 2.6.35 BSP eMMA PrP code we ported into the driver. |
+| `INSTALL.md`  | **Step-by-step Toon install using `prebuilt/`** — start here if you don't want to compile anything. |
 | `HANDOVER.md` | Detailed technical notes — every gotcha, every dead end, the wiring of the eMMA path, register addresses, etc. Read this before changing the driver. |
+
+> ⚠️ **The prebuilt module is kernel-version-specific.** It only loads on
+> `2.6.36-R10-h28` with `CONFIG_ARM_UNWIND=y` (`struct module` size `0x148`).
+> Any other Toon kernel needs a rebuild from `kernel/`. See
+> [`INSTALL.md`](INSTALL.md#%EF%B8%8F-kernel-version-this-must-match-exactly).
 
 ## What's in `kernel/mxc_vpu.c` that isn't in the stock driver
 

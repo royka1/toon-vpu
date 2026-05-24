@@ -1380,23 +1380,28 @@ static int __init vpu_init(void)
 				       (ahb_khz * 100u) / 133000u);
 			}
 
-			/* hclk_max=1: program AHB_PDF = 1 so HCLK = main2/2 =
-			 * ~155 MHz. The write is a single CSCR update; the new
-			 * divider takes effect on the next AHB clock. Logs the
-			 * new state so you can confirm in dmesg. */
-			if (hclk_max && ((cscr >> 8) & 0x3) != 1) {
-				u32 new_cscr = (cscr & ~(0x3u << 8)) | (0x1u << 8);
-				printk(KERN_WARNING "vpu: bumping HCLK: CSCR 0x%08x -> 0x%08x "
-				       "(AHB_PDF %u -> 1)\n",
-				       cscr, new_cscr, (cscr >> 8) & 0x3);
-				__raw_writel(new_cscr, ccm_base + 0x00);
-				/* re-read so the user can see it stuck */
-				new_cscr = __raw_readl(ccm_base + 0x00);
-				{
-					u32 main2 = (2u * plls_khz[0]) / 3u;
-					u32 new_ahb = main2 / (((new_cscr >> 8) & 0x3) + 1);
-					printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
-					       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
+			/* Program AHB_PDF directly from hclk_max so insmod with a
+			 * fresh parameter always lands on the requested rate (the
+			 * CSCR change is not auto-reverted by rmmod — only a reboot
+			 * resets it). hclk_max=1 -> AHB_PDF=1 (~155 MHz), anything
+			 * else -> AHB_PDF=2 (~103 MHz, Toon's shipped default). */
+			{
+				u32 want_pdf = hclk_max ? 1u : 2u;
+				u32 cur_pdf  = (cscr >> 8) & 0x3;
+				if (cur_pdf != want_pdf) {
+					u32 new_cscr = (cscr & ~(0x3u << 8)) | (want_pdf << 8);
+					printk(KERN_WARNING "vpu: %s HCLK: CSCR 0x%08x -> 0x%08x "
+					       "(AHB_PDF %u -> %u)\n",
+					       want_pdf == 1 ? "bumping" : "restoring",
+					       cscr, new_cscr, cur_pdf, want_pdf);
+					__raw_writel(new_cscr, ccm_base + 0x00);
+					new_cscr = __raw_readl(ccm_base + 0x00);
+					{
+						u32 main2 = (2u * plls_khz[0]) / 3u;
+						u32 new_ahb = main2 / (((new_cscr >> 8) & 0x3) + 1);
+						printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
+						       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
+					}
 				}
 			}
 		}

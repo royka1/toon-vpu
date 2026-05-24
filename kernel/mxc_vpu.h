@@ -84,6 +84,35 @@ struct vpu_prp_convert {
 };
 #define VPU_IOC_PRP_CONVERT	_IO(VPU_IOC_MAGIC, 22)
 
+/*
+ * Hardware YUV420 -> RGB565 via the i.MX27 eMMA Post-Processor. Same ABI as
+ * VPU_IOC_PRP_CONVERT so userspace can try PP first and fall back to PrP.
+ * Initial kernel support is intentionally limited to 1:1 output size.
+ */
+struct vpu_pp_convert {
+	u32 src_y;
+	u32 src_w, src_h;
+	u32 src_stride;
+	u32 dst_rgb;
+	u32 dst_w, dst_h;
+	u32 dst_stride;
+};
+#define VPU_IOC_PP_CONVERT	_IO(VPU_IOC_MAGIC, 23)
+
+/*
+ * Runtime PP YUV->RGB CSC adjustment. Coefficients are the raw hardware
+ * fixed-point values:
+ *   R = C0*(Y-X0) + C1*(Cr-128)
+ *   G = C0*(Y-X0) - C2*(Cb-128) - C3*(Cr-128)
+ *   B = C0*(Y-X0) + C4*(Cb-128)
+ * c0..c3 are 8-bit, c4 is 9-bit, x0 is 0 or 1 (0 or 16 luma offset).
+ */
+struct vpu_pp_csc {
+	u32 c0, c1, c2, c3, c4, x0;
+};
+#define VPU_IOC_PP_SET_CSC	_IO(VPU_IOC_MAGIC, 24)
+#define VPU_IOC_PP_GET_CSC	_IO(VPU_IOC_MAGIC, 25)
+
 #define BIT_CODE_RUN			0x000
 #define BIT_CODE_DOWN			0x004
 #define	BIT_INT_CLEAR			0x00C

@@ -1,5 +1,5 @@
 /* Live MPEG-4 stream player for the Toon: receives a raw MPEG-4 elementary
- * stream over TCP, decodes on the VPU, converts YUV->RGB565 on the eMMA PrP,
+ * stream over TCP, decodes on the VPU, converts YUV->RGB565 on eMMA PP/PrP,
  * and blits to the framebuffer. Auto-recovers: loops on accept() so the
  * Orange Pi can disconnect/reconnect without restarting this.
  *
@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -27,6 +28,10 @@
 #include "vpu_lib.h"
 #include "vpu_io.h"
 
+#ifndef FIONREAD
+#include <sys/ioctl.h>
+#endif
+
 static long now_ms(void)
 {
 	struct timeval tv;
@@ -35,6 +40,9 @@ static long now_ms(void)
 }
 
 #define STREAM_BUF_SIZE   (1 * 1024 * 1024)
+#define DRAIN_BUF_SIZE    (256 * 1024)
+#define FEED_CHUNK_SIZE   (32 * 1024)
+#define BS_LOW_WATER      (128 * 1024)
 #define ALIGN16(x)        (((x) + 15) & ~15)
 
 struct vpu_prp_convert {
@@ -42,6 +50,127 @@ struct vpu_prp_convert {
 	unsigned int dst_rgb, dst_w, dst_h, dst_stride;
 };
 #define VPU_IOC_PRP_CONVERT  _IO('V', 22)
+
+struct vpu_pp_convert {
+	unsigned int src_y, src_w, src_h, src_stride;
+	unsigned int dst_rgb, dst_w, dst_h, dst_stride;
+};
+#define VPU_IOC_PP_CONVERT   _IO('V', 23)
+
+struct vpu_pp_csc {
+	unsigned int c0, c1, c2, c3, c4, x0;
+};
+#define VPU_IOC_PP_SET_CSC   _IO('V', 24)
+#define VPU_IOC_PP_GET_CSC   _IO('V', 25)
+
+struct render_state {
+	int prp_fd;
+	vpu_mem_desc *fbmem;
+	vpu_mem_desc *rgbmem;
+	unsigned int src_w, src_h, aligned_h;
+	int stride;
+	int fb_bpp, fb_stride;
+	unsigned long fb_phys;
+	int off_x, off_y, out_w, out_h;
+	unsigned char *fb_map;
+	int fb_r_off, fb_g_off, fb_b_off;
+	int fb_r_len, fb_g_len, fb_b_len;
+	int blit_bytes;
+	unsigned int *row_scratch;
+	int *pp_ok;
+};
+
+static int render_frame(struct render_state *r, int idx, int allow_pp,
+			int allow_prp, int disable_pp_on_fail,
+			long *ms_csc, long *ms_blit,
+			long *pp_window, long *prp_window)
+{
+	struct vpu_prp_convert c;
+	long t0, t1, t2;
+	int cvt_rc = -1;
+	int used_pp = 0, used_prp = 0;
+
+	c.src_y = r->fbmem[idx].phy_addr;
+	c.src_w = r->src_w;
+	c.src_h = r->aligned_h;
+	c.src_stride = r->stride;
+	c.dst_w = r->out_w;
+	c.dst_h = r->out_h;
+	if (r->fb_bpp == 16) {
+		c.dst_rgb = r->fb_phys + (unsigned)r->off_y * r->fb_stride
+		                      + (unsigned)r->off_x * 2;
+		c.dst_stride = r->fb_stride;
+	} else {
+		c.dst_rgb = r->rgbmem->phy_addr;
+		c.dst_stride = r->out_w * 2;
+	}
+
+	t0 = now_ms();
+	if (allow_pp && *r->pp_ok) {
+		struct vpu_pp_convert p;
+
+		p.src_y = c.src_y;
+		p.src_w = c.src_w;
+		p.src_h = r->src_h;
+		p.src_stride = c.src_stride;
+		p.dst_rgb = c.dst_rgb;
+		p.dst_w = c.dst_w;
+		p.dst_h = c.dst_h;
+		p.dst_stride = c.dst_stride;
+		cvt_rc = ioctl(r->prp_fd, VPU_IOC_PP_CONVERT, &p);
+		if (cvt_rc == 0) {
+			used_pp = 1;
+		} else if (disable_pp_on_fail) {
+			int pp_errno = errno;
+
+			*r->pp_ok = 0;
+			printf("eMMA PP unavailable for this mode (errno=%d); falling back to PrP\n",
+			       pp_errno);
+			fflush(stdout);
+		}
+	}
+
+	if (cvt_rc < 0 && allow_prp) {
+		cvt_rc = ioctl(r->prp_fd, VPU_IOC_PRP_CONVERT, &c);
+		if (cvt_rc == 0)
+			used_prp = 1;
+	}
+	t1 = now_ms();
+
+	if (cvt_rc < 0)
+		return -errno;
+
+	*pp_window += used_pp;
+	*prp_window += used_prp;
+
+	if (r->fb_bpp == 32) {
+		int row, col;
+		int ro = r->fb_r_off, go = r->fb_g_off, bo = r->fb_b_off;
+		int rs = 8 - r->fb_r_len, gs = 8 - r->fb_g_len, bs = 8 - r->fb_b_len;
+		int row_bytes = r->out_w * 4;
+
+		for (row = 0; row < r->out_h; row++) {
+			unsigned short *src = (unsigned short *)
+				((unsigned char *)r->rgbmem->virt_uaddr + row * r->blit_bytes);
+			for (col = 0; col < r->out_w; col++) {
+				unsigned short p = src[col];
+				unsigned int rv = ((p >> 11) & 0x1F) << 3;
+				unsigned int gv = ((p >>  5) & 0x3F) << 2;
+				unsigned int bv = ( p        & 0x1F) << 3;
+				rv |= rv >> 5;  gv |= gv >> 6;  bv |= bv >> 5;
+				rv >>= rs;  gv >>= gs;  bv >>= bs;
+				r->row_scratch[col] = (rv << ro) | (gv << go) | (bv << bo);
+			}
+			memcpy(r->fb_map + (r->off_y + row) * r->fb_stride + r->off_x * 4,
+			       r->row_scratch, row_bytes);
+		}
+	}
+	t2 = now_ms();
+
+	*ms_csc += t1 - t0;
+	*ms_blit += t2 - t1;
+	return 0;
+}
 
 static int sock = -1;
 static vpu_mem_desc bs;
@@ -57,10 +186,12 @@ static vpu_mem_desc bs;
  */
 static volatile sig_atomic_t g_show  = 1;     /* default: legacy "show always" */
 static volatile sig_atomic_t g_armed = 1;
+static volatile sig_atomic_t g_reload_csc = 1;
 static int g_warm = 0;
 
 static void on_sigusr1(int s) { (void)s; g_show = 1; g_armed = 0; }
 static void on_sigusr2(int s) { (void)s; g_show = 0; }
+static void on_sighup(int s) { (void)s; g_reload_csc = 1; }
 
 /* SIGALRM fires if the prime phase hasn't completed within its budget.
  * (Belt; the braces are the external heartbeat file watched by camera.c
@@ -125,11 +256,22 @@ static int feed(DecHandle h, int block)
 	off = (int)(wr - bs.phy_addr);
 	chunk = STREAM_BUF_SIZE - off;
 	if (chunk > (int)space) chunk = space;
+	if (chunk > FEED_CHUNK_SIZE) chunk = FEED_CHUNK_SIZE;
 	fcntl(sock, F_SETFL, block ? 0 : O_NONBLOCK);
 	n = recv(sock, (void *)(bs.virt_uaddr + off), chunk, 0);
 	if (n > 0) { vpu_DecUpdateBitstreamBuffer(h, n); return n; }
 	if (n == 0) return 0;        /* peer closed */
 	return -1;                   /* EAGAIN */
+}
+
+static int bitstream_used(DecHandle h)
+{
+	PhysicalAddress rd, wr;
+	Uint32 space;
+
+	if (vpu_DecGetBitstreamBuffer(h, &rd, &wr, &space) != RETCODE_SUCCESS)
+		return STREAM_BUF_SIZE;
+	return STREAM_BUF_SIZE - (int)space - 1;
 }
 
 /* When the VPU can't keep up with the incoming stream, the TCP socket buffer
@@ -142,15 +284,19 @@ static int feed(DecHandle h, int block)
 static int feed_skip_to_latest(DecHandle h)
 {
 	PhysicalAddress rd, wr; Uint32 space;
-	unsigned char tmp[65536];
+	static unsigned char tmp[DRAIN_BUF_SIZE];
 	int i, total, last_ivop, off, chunk, start_at;
 	int pending;
+	int used;
 
 	/* Drop the threshold (was 16k) so we re-sync to the latest frame on
 	 * even a small backlog -- the goal here is *low* latency, not max fps.
 	 * 2k is roughly one ~320x180 MPEG-4 P-frame at our bitrate, so any
 	 * accumulated B/P-frame chain triggers a skip. */
-	if (ioctl(sock, FIONREAD, &pending) < 0 || pending < 2048)
+	if (ioctl(sock, FIONREAD, &pending) < 0)
+		return 0;
+	used = bitstream_used(h);
+	if (pending < 32768 && used < 256 * 1024)
 		return 0;   /* not enough backlog to justify dropping frames */
 
 	fcntl(sock, F_SETFL, O_NONBLOCK);
@@ -173,9 +319,18 @@ static int feed_skip_to_latest(DecHandle h)
 			last_ivop = i;
 		}
 	}
-	/* No I-VOP visible: push the data through as-is rather than risk a
-	 * P/B resync. Better one frame late than corrupt output. */
-	start_at = (last_ivop > 0) ? last_ivop : 0;
+	/* No I-VOP visible: drop the drained socket bytes. The decoder can keep
+	 * consuming whatever is already in its bitstream ring; feeding more P/B
+	 * data here is exactly how latency grows without bound. */
+	if (last_ivop < 0)
+		return 0;
+
+	start_at = last_ivop;
+
+	/* We found a clean random-access point in the socket backlog. Flush stale
+	 * compressed bytes that were already hoarded in the VPU ring, then feed
+	 * only from the latest I-VOP onward. */
+	vpu_DecBitBufferFlush(h);
 
 	if (vpu_DecGetBitstreamBuffer(h, &rd, &wr, &space) != RETCODE_SUCCESS)
 		return -1;
@@ -191,6 +346,130 @@ static int feed_skip_to_latest(DecHandle h)
 	return chunk;
 }
 
+#define CFG_PATH "/mnt/data/toonui.cfg"
+
+static char *trim_ws(char *s)
+{
+	char *e;
+
+	while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+		s++;
+	e = s + strlen(s);
+	while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
+	                 e[-1] == '\r' || e[-1] == '\n'))
+		*--e = 0;
+	return s;
+}
+
+static int clamp_int(int v, int lo, int hi)
+{
+	if (v < lo) return lo;
+	if (v > hi) return hi;
+	return v;
+}
+
+static unsigned int scale_coeff(unsigned int base, int pct, unsigned int max)
+{
+	unsigned int v;
+
+	pct = clamp_int(pct, 0, 200);
+	v = (base * (unsigned int)pct + 50) / 100;
+	return v > max ? max : v;
+}
+
+static int parse_pp_csc_csv(const char *v, struct vpu_pp_csc *csc)
+{
+	int c0, c1, c2, c3, c4, x0;
+
+	if (sscanf(v, "%i,%i,%i,%i,%i,%i", &c0, &c1, &c2, &c3, &c4, &x0) != 6)
+		return -1;
+	csc->c0 = (unsigned int)c0; csc->c1 = (unsigned int)c1;
+	csc->c2 = (unsigned int)c2; csc->c3 = (unsigned int)c3;
+	csc->c4 = (unsigned int)c4; csc->x0 = (unsigned int)x0;
+	return 0;
+}
+
+static void load_pp_csc_config(struct vpu_pp_csc *csc)
+{
+	FILE *f;
+	char line[160];
+	int luma = 100, sat = 100, red = 100, green = 100, blue = 100;
+	int raw[6];
+	int i;
+
+	csc->c0 = 0x95; csc->c1 = 0xcc; csc->c2 = 0x32;
+	csc->c3 = 0x68; csc->c4 = 0x104; csc->x0 = 1;
+	for (i = 0; i < 6; i++)
+		raw[i] = -1;
+
+	f = fopen(CFG_PATH, "r");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f)) {
+		char *k = trim_ws(line);
+		char *eq;
+		char *v;
+
+		if (!*k || *k == '#')
+			continue;
+		eq = strchr(k, '=');
+		if (!eq)
+			continue;
+		*eq = 0;
+		v = trim_ws(eq + 1);
+		k = trim_ws(k);
+
+		if (!strcmp(k, "camera_pp_luma_pct")) luma = atoi(v);
+		else if (!strcmp(k, "camera_pp_sat_pct")) sat = atoi(v);
+		else if (!strcmp(k, "camera_pp_red_pct")) red = atoi(v);
+		else if (!strcmp(k, "camera_pp_green_pct")) green = atoi(v);
+		else if (!strcmp(k, "camera_pp_blue_pct")) blue = atoi(v);
+		else if (!strcmp(k, "camera_pp_c0")) raw[0] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_c1")) raw[1] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_c2")) raw[2] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_c3")) raw[3] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_c4")) raw[4] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_x0")) raw[5] = (int)strtoul(v, NULL, 0);
+		else if (!strcmp(k, "camera_pp_csc")) parse_pp_csc_csv(v, csc);
+	}
+	fclose(f);
+
+	luma = clamp_int(luma, 0, 200);
+	sat = clamp_int(sat, 0, 200);
+	red = clamp_int((sat * clamp_int(red, 0, 200) + 50) / 100, 0, 200);
+	green = clamp_int((sat * clamp_int(green, 0, 200) + 50) / 100, 0, 200);
+	blue = clamp_int((sat * clamp_int(blue, 0, 200) + 50) / 100, 0, 200);
+
+	csc->c0 = scale_coeff(0x95, luma, 0xff);
+	csc->c1 = scale_coeff(0xcc, red, 0xff);
+	csc->c2 = scale_coeff(0x32, green, 0xff);
+	csc->c3 = scale_coeff(0x68, green, 0xff);
+	csc->c4 = scale_coeff(0x104, blue, 0x1ff);
+	csc->x0 = 1;
+
+	if (raw[0] >= 0) csc->c0 = (unsigned int)raw[0];
+	if (raw[1] >= 0) csc->c1 = (unsigned int)raw[1];
+	if (raw[2] >= 0) csc->c2 = (unsigned int)raw[2];
+	if (raw[3] >= 0) csc->c3 = (unsigned int)raw[3];
+	if (raw[4] >= 0) csc->c4 = (unsigned int)raw[4];
+	if (raw[5] >= 0) csc->x0 = (unsigned int)raw[5];
+}
+
+static void apply_pp_csc_config(int fd)
+{
+	struct vpu_pp_csc csc;
+
+	load_pp_csc_config(&csc);
+	if (ioctl(fd, VPU_IOC_PP_SET_CSC, &csc) == 0) {
+		printf("PP CSC: c0=0x%x c1=0x%x c2=0x%x c3=0x%x c4=0x%x x0=%u\n",
+		       csc.c0, csc.c1, csc.c2, csc.c3, csc.c4, csc.x0);
+	} else {
+		printf("PP CSC set failed (errno=%d); using kernel default\n", errno);
+	}
+	fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
 	/* Install signal handlers FIRST. The parent (camera.c) may send
@@ -201,6 +480,7 @@ int main(int argc, char **argv)
 	 * harmless to install before we know whether --warm was passed. */
 	signal(SIGUSR1, on_sigusr1);
 	signal(SIGUSR2, on_sigusr2);
+	signal(SIGHUP, on_sighup);
 
 	int port = 5000;
 	/* Optional --rect X Y W H: render at (X,Y) sized W x H instead of the
@@ -241,6 +521,7 @@ int main(int argc, char **argv)
 	FrameBuffer fb[32];
 	int fbcount = 0, stride = 0, ah = 0, ysize = 0, csize = 0, mvsize = 0;
 	int prp_fd, fb_alloced = 0, blit_bytes = 0;
+	int pp_ok = 1;
 	unsigned int *row_scratch = NULL;   /* one row of 32bpp, cached DRAM */
 
 	signal(SIGPIPE, SIG_IGN);
@@ -303,6 +584,8 @@ int main(int argc, char **argv)
 	bs.size = STREAM_BUF_SIZE;
 	if (IOGetPhyMem(&bs) || IOGetVirtMem(&bs) <= 0) { fprintf(stderr, "bs alloc\n"); return 1; }
 	prp_fd = open("/dev/mxc_vpu", O_RDWR);
+	apply_pp_csc_config(prp_fd);
+	g_reload_csc = 0;
 	printf("vpu_stream ready; listening tcp/%d\n", port); fflush(stdout);
 
 	/* ---- per-connection loop ----
@@ -485,116 +768,152 @@ int main(int argc, char **argv)
 
 		long t_window = now_ms(), f_window = 0;
 		long ms_dec = 0, ms_prp = 0, ms_blit = 0;
+		long pp_window = 0, prp_window = 0, pipe_window = 0;
+		int pending_idx = -1, pending_display = 0, pp_pipeline_ok = 1;
+		int pp_pipeline_cooldown = 0;
+		long pending_dec_ms = 0;
+		struct render_state rs;
 
-		/* Sequential decode/display loop.
+		memset(&rs, 0, sizeof(rs));
+		rs.prp_fd = prp_fd;
+		rs.fbmem = fbmem;
+		rs.rgbmem = &rgbmem;
+		rs.src_w = ii.picWidth;
+		rs.src_h = ii.picHeight;
+		rs.aligned_h = ah;
+		rs.stride = stride;
+		rs.fb_bpp = fb_bpp;
+		rs.fb_stride = fb_stride;
+		rs.fb_phys = fb_phys;
+		rs.off_x = off_x;
+		rs.off_y = off_y;
+		rs.out_w = out_w;
+		rs.out_h = out_h;
+		rs.fb_map = fb_map;
+		rs.fb_r_off = fb_r_off;
+		rs.fb_g_off = fb_g_off;
+		rs.fb_b_off = fb_b_off;
+		rs.fb_r_len = fb_r_len;
+		rs.fb_g_len = fb_g_len;
+		rs.fb_b_len = fb_b_len;
+		rs.blit_bytes = blit_bytes;
+		rs.row_scratch = row_scratch;
+		rs.pp_ok = &pp_ok;
+
+		/* Decode/display loop.
 		 *
 		 * Note: an earlier attempt to overlap the PrP of frame N with the
 		 * decode of N+1 deadlocked on the *very first* concurrent ioctl
-		 * -- the eMMA PrP's wait_event in the kernel never returns while
-		 * the VPU's vpu_lock is held by an in-flight DecStartOneFrame.
-		 * The two IP blocks have separate DMA, separate IRQs, and CAN
-		 * physically run in parallel; the bottleneck is in the driver
-		 * serialisation. Lifting it requires a kernel patch to allow
-		 * VPU_IOC_PRP_CONVERT to enter without holding the VPU mutex.
-		 * Until then we stick with sequential PrP-after-VPU and keep
-		 * the (already-shipped) PrP-to-fb-phys win.
+		 * -- the eMMA PrP IRQ never arrived while the VPU was bursting.
+		 * PP is the post-decode block, so try a guarded one-frame-late
+		 * PP pipeline. If PP fails during overlap we fall back to the
+		 * shipped sequential path.
 		 */
 		for (;;) {
 			DecParam dp; DecOutputInfo oi;
+			int rendered_pending = 0;
 			/* When falling behind (socket buffer > 32KB), discard stale
 			 * data and re-sync at the most recent I-VOP so the delay
 			 * doesn't grow unbounded. */
 			long t0 = now_ms();
+			if (g_reload_csc) {
+				g_reload_csc = 0;
+				apply_pp_csc_config(prp_fd);
+			}
+			if (!pp_pipeline_ok && pp_pipeline_cooldown > 0) {
+				pp_pipeline_cooldown--;
+				if (pp_pipeline_cooldown == 0) {
+					pp_pipeline_ok = 1;
+					printf("eMMA PP pipeline retrying\n");
+					fflush(stdout);
+				}
+			}
 			feed_skip_to_latest(h);
 			if (feed(h, 0) == 0) break;
 			memset(&dp, 0, sizeof(dp));
 			if (vpu_DecStartOneFrame(h, &dp) != RETCODE_SUCCESS) break;
+
+			if (pending_idx >= 0 && pending_display && pp_ok && pp_pipeline_ok) {
+				int prc = render_frame(&rs, pending_idx, 1, 0, 0,
+						       &ms_prp, &ms_blit,
+						       &pp_window, &prp_window);
+				if (prc == 0) {
+					rendered_pending = 1;
+					pipe_window++;
+				} else {
+					pp_pipeline_ok = 0;
+					pp_pipeline_cooldown = 120;
+					printf("eMMA PP pipeline failed (rc=%d); continuing sequential\n",
+					       prc);
+					fflush(stdout);
+				}
+			}
+
 			i = 0;
 			while (vpu_IsBusy()) {
-				if (vpu_WaitForInt(20) != 0) { if (feed(h, 0) == 0) goto disc; }
-				if (++i > 50) break;
+				if (vpu_WaitForInt(40) != 0) {
+					int fr = -1;
+					if (bitstream_used(h) < BS_LOW_WATER)
+						fr = feed(h, 0);
+					if (fr == 0)
+						goto disc;
+				}
+				if (++i > 30) break;
 			}
 			memset(&oi, 0, sizeof(oi));
 			if (vpu_DecGetOutputInfo(h, &oi) != RETCODE_SUCCESS) break;
 			long t1 = now_ms();
+
+			if (pending_idx >= 0) {
+				if (pending_display && !rendered_pending)
+					render_frame(&rs, pending_idx, pp_ok, 1, 1,
+						     &ms_prp, &ms_blit,
+						     &pp_window, &prp_window);
+				vpu_DecClrDispFlag(h, pending_idx);
+				ms_dec += pending_dec_ms;
+				frames++; f_window++;
+				g_progress = 1;
+				if (f_window >= 60) {
+					long el = now_ms() - t_window;
+					printf("%.1f fps over %ld frames%s | per-frame avg: dec %ldms csc %ldms blit %ldms | pp %ld prp %ld pipe %ld\n",
+						   (f_window * 1000.0) / (el ? el : 1), f_window,
+						   g_show ? (g_armed ? "" : " (waiting for I)") : " (warm/hidden)",
+						   ms_dec / f_window, ms_prp / f_window, ms_blit / f_window,
+						   pp_window, prp_window, pipe_window);
+					fflush(stdout);
+					t_window = now_ms(); f_window = 0;
+					pp_window = prp_window = pipe_window = 0;
+					ms_dec = ms_prp = ms_blit = 0;
+				}
+				pending_idx = -1;
+				pending_display = 0;
+				pending_dec_ms = 0;
+			}
+
 			if (oi.indexFrameDisplay >= 0 && oi.indexFrameDisplay < fbcount) {
 				int idx = oi.indexFrameDisplay;
-				long t2 = t1, t3 = t1;
 				if (g_show && !g_armed && oi.picType == 0)
 					g_armed = 1;
 
 				if (g_show && g_armed) {
-					struct vpu_prp_convert c;
-					/* PrP: YUV->RGB565 + bilinear resize in one hw pass.
-					 * 16bpp: dst is fb_phys directly (cutout offset baked
-					 * in, stride = fb_stride so PrP skips the right margin
-					 * per row) -- no CPU memcpy needed. 32bpp: PrP writes
-					 * to the RGB565 bounce buffer; CPU widens below. */
-					c.src_y = fbmem[idx].phy_addr; c.src_w = ii.picWidth; c.src_h = ah;
-					c.src_stride = stride;
-					c.dst_w = out_w; c.dst_h = out_h;
-					if (fb_bpp == 16) {
-						c.dst_rgb    = fb_phys + (unsigned)off_y * fb_stride
-						                       + (unsigned)off_x * 2;
-						c.dst_stride = fb_stride;
-					} else {
-						c.dst_rgb    = rgbmem.phy_addr;
-						c.dst_stride = out_w * 2;
-					}
-					ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &c);
-					t2 = now_ms();
-					if (fb_bpp == 16) {
-						/* No blit -- PrP wrote into the framebuffer directly. */
-					} else {
-						/* 32bpp target: widen RGB565 -> packed 8:8:8 using the
-						 * kernel-reported channel offsets so this works on
-						 * xRGB, BGRx, ARGB, ... whatever the panel driver
-						 * chose this boot. */
-						int row, col;
-						int ro = fb_r_off, go = fb_g_off, bo = fb_b_off;
-						int rs = 8 - fb_r_len, gs = 8 - fb_g_len, bs = 8 - fb_b_len;
-						int row_bytes = out_w * 4;
-						for (row = 0; row < out_h; row++) {
-							unsigned short *src = (unsigned short *)
-								((unsigned char *)rgbmem.virt_uaddr + row * blit_bytes);
-							for (col = 0; col < out_w; col++) {
-								unsigned short p = src[col];
-								unsigned int r = ((p >> 11) & 0x1F) << 3;
-								unsigned int g = ((p >>  5) & 0x3F) << 2;
-								unsigned int b = ( p        & 0x1F) << 3;
-								r |= r >> 5;  g |= g >> 6;  b |= b >> 5;
-								r >>= rs;  g >>= gs;  b >>= bs;
-								row_scratch[col] = (r << ro) | (g << go) | (b << bo);
-							}
-							memcpy(fb_map + (off_y + row) * fb_stride + off_x * 4,
-								   row_scratch, row_bytes);
-						}
-					}
-					t3 = now_ms();
-				}
-				/* Always release the frame to the decoder pool. */
-				vpu_DecClrDispFlag(h, idx);
-				ms_dec += (t1 - t0); ms_prp += (t2 - t1); ms_blit += (t3 - t2);
-				frames++; f_window++;
-				/* Every successful frame is progress. (Setting once per
-				 * frame is cheap and ensures even slow streams keep the
-				 * heartbeat fresh.) */
-				g_progress = 1;
-				if (f_window >= 60) {
-					long el = now_ms() - t_window;
-					printf("%.1f fps over %ld frames%s | per-frame avg: dec %ldms prp %ldms blit %ldms\n",
-						   (f_window * 1000.0) / (el ? el : 1), f_window,
-						   g_show ? (g_armed ? "" : " (waiting for I)") : " (warm/hidden)",
-						   ms_dec / f_window, ms_prp / f_window, ms_blit / f_window);
-					fflush(stdout);
-					t_window = now_ms(); f_window = 0;
-					ms_dec = ms_prp = ms_blit = 0;
+					pending_idx = idx;
+					pending_display = 1;
+					pending_dec_ms = t1 - t0;
+				} else {
+					vpu_DecClrDispFlag(h, idx);
+					ms_dec += t1 - t0;
+					frames++; f_window++;
+					g_progress = 1;
 				}
 			}
 			if (oi.indexFrameDecoded < 0 && oi.indexFrameDisplay < 0)
 				if (feed(h, 1) == 0) break;
 		}
-disc:
+	disc:
+		if (pending_idx >= 0) {
+			vpu_DecClrDispFlag(h, pending_idx);
+			pending_idx = -1;
+		}
 		printf("client gone (%d frames); re-listening\n", frames); fflush(stdout);
 		g_active = 0;   /* back to accept idle */
 		vpu_DecClose(h);

@@ -77,7 +77,17 @@ static struct device *vpu_dev;
 
 static void __iomem *vpu_base;
 static void __iomem *ccm_base;	/* i.MX27 CCM, for forcing VPU clock gates */
+static void __iomem *pp_base;	/* i.MX27 eMMA PP (post-decode YUV->RGB) */
 static void __iomem *prp_base;	/* i.MX27 eMMA PrP (HW YUV->RGB + resize) */
+static int pp_irq_num;
+static int pp_done;
+static int pp_status;
+static wait_queue_head_t pp_queue;
+static DEFINE_MUTEX(pp_lock);
+static struct vpu_pp_csc pp_csc = {
+	.c0 = 0x95, .c1 = 0xcc, .c2 = 0x32,
+	.c3 = 0x68, .c4 = 0x104, .x0 = 1,
+};
 static int prp_irq_num;
 static int prp_done;
 static wait_queue_head_t prp_queue;
@@ -256,6 +266,341 @@ static int vpu_free_buffers(void)
 		}
 	}
 
+	return 0;
+}
+
+/* Force eMMA clock gates on (emma_clk=PCCR0 bit27, emma_clk1=PCCR1 bit18). */
+static inline void emma_force_clk_on(void)
+{
+	if (ccm_base) {
+		__raw_writel(__raw_readl(ccm_base + 0x20) | (1 << 27), ccm_base + 0x20);
+		__raw_writel(__raw_readl(ccm_base + 0x24) | (1 << 18), ccm_base + 0x24);
+	}
+}
+
+/*
+ * ============================================================================
+ * i.MX27 eMMA PP: post-decode YUV420 -> RGB565.  This is the SoC block that
+ * was intended to consume decoded YUV frames before display.
+ * ============================================================================
+ */
+#define PPW(o, v)	__raw_writel((v), pp_base + (o))
+#define PPR(o)		__raw_readl(pp_base + (o))
+
+#define PP_CNTL			0x00
+#define PP_INTRCNTL		0x04
+#define PP_INTRSTATUS		0x08
+#define PP_SOURCE_Y_PTR		0x0c
+#define PP_SOURCE_CB_PTR	0x10
+#define PP_SOURCE_CR_PTR	0x14
+#define PP_DEST_RGB_PTR		0x18
+#define PP_QUANTIZER_PTR	0x1c
+#define PP_PROCESS_PARA		0x20
+#define PP_FRAME_WIDTH		0x24
+#define PP_DISPLAY_WIDTH	0x28
+#define PP_IMAGE_SIZE		0x2c
+#define PP_DEST_FRAME_FMT_CNTL	0x30
+#define PP_RESIZE_INDEX		0x34
+#define PP_CSC_COEF_123		0x38
+#define PP_CSC_COEF_4		0x3c
+#define PP_RESIZE_COEF_TBL	0x100
+
+#define PP_CNTL_CSC_OUT_RGB565	(2 << 10)
+#define PP_CNTL_SWRST		(1 << 8)
+#define PP_CNTL_CSC_TABLE_A0	(1 << 5)
+#define PP_CNTL_CSCEN		(1 << 4)
+#define PP_CNTL_PP_EN		(1 << 0)
+
+#define PP_INTR_ERR		(1 << 2)
+#define PP_INTR_FRAME		(1 << 0)
+
+#define PP_RESIZE_COEF(w, n, op)	(((w) << 3) | ((n) << 1) | (op))
+#define PP_SKIP			1
+#define PP_TBL_MAX		40
+#define PP_BC_NXT		2
+#define PP_BC_COEF		5
+#define PP_SZ_COEF		(1 << PP_BC_COEF)
+#define PP_SZ_NXT		(1 << PP_BC_NXT)
+
+static irqreturn_t pp_irq_handler(int irq, void *dev_id)
+{
+	u32 st = PPR(PP_INTRSTATUS) & (PP_INTR_ERR | PP_INTR_FRAME);
+
+	if (!st)
+		return IRQ_HANDLED;
+
+	PPW(PP_INTRSTATUS, st);
+	pp_status = st;
+	pp_done = 1;
+	wake_up_interruptible(&pp_queue);
+	return IRQ_HANDLED;
+}
+
+static int pp_csc_valid(const struct vpu_pp_csc *csc)
+{
+	if (csc->c0 > 0xff || csc->c1 > 0xff || csc->c2 > 0xff ||
+	    csc->c3 > 0xff || csc->c4 > 0x1ff || csc->x0 > 1)
+		return 0;
+	return 1;
+}
+
+static unsigned int pp_gcd(unsigned int x, unsigned int y)
+{
+	unsigned int k;
+
+	if (x < y) {
+		k = x;
+		x = y;
+		y = k;
+	}
+
+	while ((k = x % y)) {
+		x = y;
+		y = k;
+	}
+
+	return y;
+}
+
+static int pp_scale_0d(u16 *tbl, int k, int coeff, int base, int nxt)
+{
+	if (k >= PP_TBL_MAX)
+		return -ENOSPC;
+
+	coeff = ((coeff << PP_BC_COEF) + (base >> 1)) / base;
+
+	/*
+	 * Valid PP weights are 0, 2..30 and 31. 31 is treated by the block as
+	 * 32, so avoid generating raw 31 except for the forced 1:1 case.
+	 */
+	if (coeff >= PP_SZ_COEF - 1)
+		coeff--;
+	else if (coeff == 1)
+		coeff++;
+	coeff <<= PP_BC_NXT;
+
+	if (nxt < PP_SZ_NXT) {
+		tbl[k++] = (coeff | nxt) << 1 | 1;
+	} else {
+		coeff |= PP_SKIP;
+		tbl[k++] = coeff << 1 | 1;
+		nxt -= PP_SKIP;
+		do {
+			if (k >= PP_TBL_MAX)
+				return -ENOSPC;
+			coeff = (nxt > PP_SKIP) ? PP_SKIP : nxt;
+			tbl[k++] = coeff << 1;
+		} while ((nxt -= PP_SKIP) > 0);
+	}
+
+	return k;
+}
+
+/*
+ * Build one PP resize coefficient sequence. This is the Freescale mx27_pp.c
+ * algorithm trimmed to exact ratios; callers reduce input/output dimensions
+ * before entry so common video sizes fit in the 40-entry hardware table.
+ */
+static int pp_scale_1d(u16 *tbl, int inv, int outv, int k)
+{
+	int v;
+	int coeff;
+	int nxt;
+
+	if (inv == outv)
+		return pp_scale_0d(tbl, k, 1, 1, 1);
+
+	v = 0;
+	if (inv < outv) {
+		do {
+			coeff = outv - v;
+			v += inv;
+			if (v >= outv) {
+				v -= outv;
+				nxt = 1;
+			} else {
+				nxt = 0;
+			}
+			k = pp_scale_0d(tbl, k, coeff, outv, nxt);
+			if (k < 0)
+				return k;
+		} while (v);
+	} else if (inv >= 2 * outv) {
+		if ((inv != 2 * outv) && (inv != 4 * outv))
+			return -EOPNOTSUPP;
+		coeff = inv - 2 * outv;
+		v = 0;
+		do {
+			v += coeff;
+			nxt = 2;
+			while (v >= outv) {
+				v -= outv;
+				nxt++;
+			}
+			k = pp_scale_0d(tbl, k, 1, 2, nxt);
+			if (k < 0)
+				return k;
+		} while (v);
+	} else {
+		int in_pos_inc = 2 * outv;
+		int out_pos = inv;
+		int out_pos_inc = 2 * inv;
+		int init_carry = inv - outv;
+		int carry = init_carry;
+
+		v = outv + in_pos_inc;
+		do {
+			coeff = v - out_pos;
+			out_pos += out_pos_inc;
+			carry += out_pos_inc;
+			for (nxt = 0; v < out_pos; nxt++) {
+				v += in_pos_inc;
+				carry -= in_pos_inc;
+			}
+			k = pp_scale_0d(tbl, k, coeff, in_pos_inc, nxt);
+			if (k < 0)
+				return k;
+		} while (carry != init_carry);
+	}
+
+	return k;
+}
+
+static int pp_build_resize(u16 *tbl, unsigned int src_w, unsigned int src_h,
+			   unsigned int dst_w, unsigned int dst_h,
+			   u32 *index_reg, int *tbl_len)
+{
+	unsigned int g;
+	int hn, hd, vn, vd;
+	int hlen;
+	int vlen;
+
+	g = pp_gcd(src_w, dst_w);
+	hn = src_w / g;
+	hd = dst_w / g;
+	g = pp_gcd(src_h, dst_h);
+	vn = src_h / g;
+	vd = dst_h / g;
+
+	if (hn > 20 || hd > 20 || vn > 20 || vd > 20)
+		return -EOPNOTSUPP;
+
+	hlen = pp_scale_1d(tbl, hn, hd, 0);
+	if (hlen <= 0)
+		return hlen ? hlen : -EOPNOTSUPP;
+
+	if (hn == vn && hd == vd) {
+		vlen = hlen;
+		*index_reg = ((hlen - 1) << 16) | (vlen - 1);
+	} else {
+		vlen = pp_scale_1d(tbl, vn, vd, hlen);
+		if (vlen <= hlen)
+			return vlen < 0 ? vlen : -EOPNOTSUPP;
+		*index_reg = ((hlen - 1) << 16) | (hlen << 8) | (vlen - 1);
+	}
+
+	*tbl_len = vlen;
+	return 0;
+}
+
+/* One-shot hardware YUV420(planar) -> RGB565 with PP resize. */
+static int pp_convert(struct vpu_pp_convert *c)
+{
+	u16 resize_tbl[PP_TBL_MAX];
+	u32 ysz;
+	u32 src_layout_h;
+	u32 fmt;
+	u32 cntl;
+	u32 resize_index;
+	int resize_len;
+	int i;
+	int rc;
+
+	if (!pp_base)
+		return -ENODEV;
+	if (c->src_w < 32 || c->src_h < 32 || c->dst_w < 8 || c->dst_h < 8)
+		return -EINVAL;
+	if ((c->src_w & 7) || (c->src_h & 7) || (c->src_stride & 7))
+		return -EINVAL;
+	if ((c->dst_w & 1) || (c->dst_h & 1) || (c->dst_stride & 3))
+		return -EINVAL;
+	if ((c->src_y | c->dst_rgb) & 3)
+		return -EINVAL;
+	if (c->src_stride < c->src_w || c->dst_stride < c->dst_w * 2)
+		return -EINVAL;
+	rc = pp_build_resize(resize_tbl, c->src_w, c->src_h, c->dst_w, c->dst_h,
+			     &resize_index, &resize_len);
+	if (rc)
+		return rc == -ENOSPC ? -EOPNOTSUPP : rc;
+
+	mutex_lock(&pp_lock);
+	emma_force_clk_on();
+
+	PPW(PP_CNTL, PP_CNTL_SWRST);
+	for (i = 0; i < 1000; i++) {
+		if (!(PPR(PP_CNTL) & PP_CNTL_SWRST))
+			break;
+		udelay(1);
+	}
+	if (i == 1000) {
+		mutex_unlock(&pp_lock);
+		return -ETIME;
+	}
+	PPW(PP_INTRSTATUS, PP_INTR_ERR | PP_INTR_FRAME);
+
+	/*
+	 * The VPU lays out Cb/Cr after the 16-line-aligned Y plane, while PP
+	 * should process only the visible height. Deriving chroma addresses
+	 * from c->src_h corrupts the first chroma rows for heights like 360.
+	 */
+	src_layout_h = (c->src_h + 15) & ~15;
+	ysz = c->src_stride * src_layout_h;
+	PPW(PP_SOURCE_Y_PTR, c->src_y);
+	PPW(PP_SOURCE_CB_PTR, c->src_y + ysz);
+	PPW(PP_SOURCE_CR_PTR, c->src_y + ysz + (ysz >> 2));
+	PPW(PP_DEST_RGB_PTR, c->dst_rgb);
+	PPW(PP_QUANTIZER_PTR, 0);
+
+	PPW(PP_PROCESS_PARA, (c->src_w << 16) | c->src_h);
+	PPW(PP_FRAME_WIDTH, c->src_stride);
+	PPW(PP_DISPLAY_WIDTH, c->dst_stride);
+	PPW(PP_IMAGE_SIZE, (c->dst_w << 16) | c->dst_h);
+
+	/* RGB565: R offset 11 width 5, G offset 5 width 6, B offset 0 width 5. */
+	fmt = (11 << 26) | (5 << 21) | (0 << 16) | (5 << 8) | (6 << 4) | 5;
+	PPW(PP_DEST_FRAME_FMT_CNTL, fmt);
+
+	PPW(PP_CSC_COEF_123, (pp_csc.c0 << 24) | (pp_csc.c1 << 16) |
+			     (pp_csc.c2 << 8) | pp_csc.c3);
+	PPW(PP_CSC_COEF_4, (pp_csc.x0 ? (1 << 9) : 0) | pp_csc.c4);
+
+	PPW(PP_RESIZE_INDEX, resize_index);
+	for (i = 0; i < resize_len; i++)
+		PPW(PP_RESIZE_COEF_TBL + i * 4, resize_tbl[i]);
+
+	PPW(PP_INTRCNTL, PP_INTR_ERR | PP_INTR_FRAME);
+	pp_status = 0;
+	pp_done = 0;
+
+	/* The manual requires an idle/lock read before PP_EN is accepted. */
+	cntl = PPR(PP_CNTL);
+	(void)cntl;
+	PPW(PP_CNTL, PP_CNTL_CSC_OUT_RGB565 | PP_CNTL_CSC_TABLE_A0 |
+	     PP_CNTL_CSCEN | PP_CNTL_PP_EN);
+
+	rc = wait_event_interruptible_timeout(pp_queue, pp_done != 0,
+					      msecs_to_jiffies(200));
+	if (rc <= 0) {
+		PPW(PP_CNTL, PP_CNTL_SWRST);
+		mutex_unlock(&pp_lock);
+		return rc < 0 ? rc : -ETIME;
+	}
+	if (pp_status & PP_INTR_ERR) {
+		PPW(PP_CNTL, PP_CNTL_SWRST);
+		mutex_unlock(&pp_lock);
+		return -EIO;
+	}
+	mutex_unlock(&pp_lock);
 	return 0;
 }
 
@@ -558,13 +903,9 @@ static void prp_set_scaler(int dir, scale_t *scale)
 	PRPW(off + 8, valid);
 }
 
-/* Force the eMMA clock gates on (emma_clk=PCCR0 bit27, emma_clk1=PCCR1 bit18). */
 static inline void prp_force_clk_on(void)
 {
-	if (ccm_base) {
-		__raw_writel(__raw_readl(ccm_base + 0x20) | (1 << 27), ccm_base + 0x20);
-		__raw_writel(__raw_readl(ccm_base + 0x24) | (1 << 18), ccm_base + 0x24);
-	}
+	emma_force_clk_on();
 }
 
 static irqreturn_t prp_irq_handler(int irq, void *dev_id)
@@ -813,6 +1154,39 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 			if (copy_from_user(&cvt, (void __user *)arg, sizeof(cvt)))
 				return -EFAULT;
 			ret = prp_convert(&cvt);
+			break;
+		}
+	case VPU_IOC_PP_CONVERT:
+		{
+			struct vpu_pp_convert cvt;
+
+			if (copy_from_user(&cvt, (void __user *)arg, sizeof(cvt)))
+				return -EFAULT;
+			ret = pp_convert(&cvt);
+			break;
+		}
+	case VPU_IOC_PP_SET_CSC:
+		{
+			struct vpu_pp_csc csc;
+
+			if (copy_from_user(&csc, (void __user *)arg, sizeof(csc)))
+				return -EFAULT;
+			if (!pp_csc_valid(&csc))
+				return -EINVAL;
+			mutex_lock(&pp_lock);
+			pp_csc = csc;
+			mutex_unlock(&pp_lock);
+			break;
+		}
+	case VPU_IOC_PP_GET_CSC:
+		{
+			struct vpu_pp_csc csc;
+
+			mutex_lock(&pp_lock);
+			csc = pp_csc;
+			mutex_unlock(&pp_lock);
+			if (copy_to_user((void __user *)arg, &csc, sizeof(csc)))
+				return -EFAULT;
 			break;
 		}
 	case VPU_IOC_IRAM_SETTING:
@@ -1503,6 +1877,23 @@ static int __init vpu_init(void)
 		printk(KERN_WARNING "vpu: DMA pool empty -- module loaded too late "
 		       "in boot? VPU buffer allocation will fail.\n");
 
+	/* eMMA PP: post-decode YUV->RGB color conversion for the display path. */
+	init_waitqueue_head(&pp_queue);
+	pp_base = ioremap(MX27_EMMA_PP_BASE_ADDR, SZ_4K);
+	if (!pp_base) {
+		printk(KERN_WARNING "vpu: eMMA PP ioremap failed; no PP CSC\n");
+	} else {
+		pp_irq_num = MX27_INT_EMMAPP;
+		if (request_irq(pp_irq_num, pp_irq_handler, 0, "VPU_PP_IRQ", NULL)) {
+			printk(KERN_WARNING "vpu: eMMA PP IRQ %d request failed\n",
+			       pp_irq_num);
+			iounmap(pp_base);
+			pp_base = NULL;
+		} else {
+			printk(KERN_INFO "vpu: eMMA PP ready (post-decode HW YUV->RGB)\n");
+		}
+	}
+
 	/* eMMA PrP: hardware YUV->RGB color conversion for the display path. */
 	init_waitqueue_head(&prp_queue);
 	prp_base = ioremap(MX27_EMMA_PRP_BASE_ADDR, SZ_4K);
@@ -1539,6 +1930,10 @@ err_iounmap:
 static void __exit vpu_exit(void)
 {
 	free_irq(vpu_irq, (void *)(&vpu_data));
+	if (pp_base) {
+		free_irq(pp_irq_num, NULL);
+		iounmap(pp_base);
+	}
 	if (prp_base) {
 		free_irq(prp_irq_num, NULL);
 		iounmap(prp_base);

@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <linux/fb.h>
 #include <sys/time.h>
+#include <pthread.h>
 #include "vpu_lib.h"
 #include "vpu_io.h"
 
@@ -60,6 +61,59 @@ static int g_warm = 0;
 
 static void on_sigusr1(int s) { (void)s; g_show = 1; g_armed = 0; }
 static void on_sigusr2(int s) { (void)s; g_show = 0; }
+
+/* SIGALRM fires if the prime phase hasn't completed within its budget.
+ * (Belt; the braces are the external heartbeat file watched by camera.c
+ * which SIGKILLs us if it goes stale -- some libvpu hangs can't be
+ * interrupted by a userspace signal alone.) */
+static void on_sigalrm(int s)
+{
+	(void)s;
+	const char msg[] = "prime watchdog fired; exiting for clean restart\n";
+	(void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+	_exit(2);
+}
+
+/* Heartbeat: a dedicated pthread touches /tmp/vpu_stream.tick whenever
+ * the main thread has made forward progress (set g_progress = 1 from
+ * the main loop). If the main thread is wedged -- e.g., stuck inside a
+ * libvpu call that won't return -- the flag stays 0 and the heartbeat
+ * file mtime ages out. camera.c's watchdog SIGKILLs us once mtime > 10s.
+ *
+ * The thread (not main itself) writes the file so it keeps running even
+ * if main is blocked in a long ioctl: that's important because we want
+ * the watchdog to detect the wedge, not be silently bypassed. */
+#define HEARTBEAT_PATH "/tmp/vpu_stream.tick"
+/* Two flags so the watchdog only matters when main SHOULD be making progress:
+ *   g_active   -- main is in the prime/decode path (we expect frames).
+ *   g_progress -- main has made forward progress since the last tick.
+ *
+ * When !active (idling in accept(), client not yet connected): always
+ * touch the heartbeat -- there's nothing to wedge on, the long sleep
+ * inside accept() is the intended behavior.
+ *
+ * When active: only touch if main set g_progress. If main is wedged in
+ * a libvpu call, g_progress stays 0 -> mtime ages out -> SIGKILL.
+ */
+static volatile sig_atomic_t g_active   = 0;
+static volatile sig_atomic_t g_progress = 1;
+static void heartbeat_write(void)
+{
+	int fd = open(HEARTBEAT_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) close(fd);
+}
+static void * heartbeat_thread(void *unused)
+{
+	(void)unused;
+	heartbeat_write();   /* fresh from the start */
+	for (;;) {
+		sleep(3);
+		if (!g_active || __sync_fetch_and_and(&g_progress, 0))
+			heartbeat_write();
+		/* else (active && no progress): wedged -> let it go stale */
+	}
+	return NULL;
+}
 
 static int feed(DecHandle h, int block)
 {
@@ -181,6 +235,18 @@ int main(int argc, char **argv)
 	unsigned int *row_scratch = NULL;   /* one row of 32bpp, cached DRAM */
 
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGALRM, on_sigalrm);
+
+	/* Start the heartbeat thread BEFORE anything that can hang. The
+	 * watchdog in camera.c only kills us if heartbeat goes stale, so
+	 * the thread needs to be alive even when main is wedged. */
+	{
+		pthread_t hb;
+		if (pthread_create(&hb, NULL, heartbeat_thread, NULL) == 0)
+			pthread_detach(hb);
+		else
+			fprintf(stderr, "heartbeat thread failed; watchdog will misfire\n");
+	}
 	if (g_warm) {
 		signal(SIGUSR1, on_sigusr1);   /* show:  unmask blits at next I */
 		signal(SIGUSR2, on_sigusr2);   /* hide:  back to warm/no-blit */
@@ -189,6 +255,12 @@ int main(int argc, char **argv)
 
 	lsock = socket(AF_INET, SOCK_STREAM, 0);
 	setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+	/* If a previous vpu_stream is still in TIME_WAIT, SO_REUSEADDR
+	 * alone is sometimes insufficient on this old kernel. SO_REUSEPORT
+	 * lets the new bind go through regardless. */
+	setsockopt(lsock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
 	if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
@@ -225,14 +297,45 @@ int main(int argc, char **argv)
 	prp_fd = open("/dev/mxc_vpu", O_RDWR);
 	printf("vpu_stream ready; listening tcp/%d\n", port); fflush(stdout);
 
-	/* ---- per-connection loop ---- */
+	/* ---- per-connection loop ----
+	 * Long-lived: keeps vpu_Init's single VPU init across reconnects (a
+	 * fresh vpu_Init in a respawned process turned out to corrupt the
+	 * kernel's clock refcount + wedge the eMMA after a few cycles).
+	 * Reconnect handling: vpu_DecClose, accept again, vpu_DecOpen, prime.
+	 * The prime phase is watchdogged via SIGALRM (5 s) so a hung
+	 * vpu_DecGetInitialInfo (which can sit inside libvpu forever after
+	 * a poorly-closed prior stream) kills the process cleanly instead
+	 * of pegging the CPU + flooding the kernel with VPU timeouts.
+	 * camera.c's watchdog respawns us with a delay so the TCP port
+	 * has time to clear TIME_WAIT. */
 	for (;;) {
 		DecHandle h;
 		int inited = 0, off_x, off_y, frames = 0;
 
 		printf("waiting for stream...\n"); fflush(stdout);
+		g_active = 0;   /* idle in accept -- watchdog should not gate on progress */
 		sock = accept(lsock, NULL, NULL);
+		g_active = 1;   /* got a connection -- now we must make progress */
+		g_progress = 1;
 		if (sock < 0) continue;
+		/* Stale-socket guard. If the OPi rapidly reconnects (kill+
+		 * restart of its ffmpeg, or a TCP RST that didn't deliver
+		 * its FIN cleanly), our accept queue can have a leftover
+		 * mid-stream socket sitting in front of the fresh one. Take
+		 * the freshest by draining everything else still queued -- the
+		 * mid-stream one has no sequence header so the prime phase
+		 * would hang on it forever. Done with a NONBLOCK toggle on
+		 * lsock so any queued sockets pop out as accept()=-1+EAGAIN. */
+		fcntl(lsock, F_SETFL, fcntl(lsock, F_GETFL, 0) | O_NONBLOCK);
+		for (;;) {
+			int next = accept(lsock, NULL, NULL);
+			if (next < 0) break;
+			printf("discarding stale queued socket; taking newer one\n");
+			fflush(stdout);
+			close(sock);
+			sock = next;
+		}
+		fcntl(lsock, F_SETFL, fcntl(lsock, F_GETFL, 0) & ~O_NONBLOCK);
 		/* A fresh decoder needs a fresh I-frame before its output is
 		 * trustworthy. If the prior connection was being shown, we'd
 		 * happily blit the new decoder's first P-frame against an empty
@@ -246,6 +349,13 @@ int main(int argc, char **argv)
 		 * the rest. */
 		int rcvbuf = 32 * 1024;
 		setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+		/* 5s recv timeout: if the stream wedges (peer silently dies, or
+		 * sends partial-frame garbage forever), blocking feed(h,1) in
+		 * the prime phase or block-fallback in decode would otherwise
+		 * pin the decoder. EAGAIN/EWOULDBLOCK -> feed returns -1 and
+		 * the loop progresses; 0 (EOF) breaks back to accept. */
+		struct timeval rcvto = { .tv_sec = 5, .tv_usec = 0 };
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof rcvto);
 		printf("client connected\n"); fflush(stdout);
 
 		memset(&op, 0, sizeof(op));
@@ -256,14 +366,32 @@ int main(int argc, char **argv)
 		op.filePlayEnable = 0;
 		if (vpu_DecOpen(&h, &op) != RETCODE_SUCCESS) { close(sock); continue; }
 
-		/* prime: feed until the sequence header parses */
-		while (!inited) {
-			if (feed(h, 1) <= 0) break;            /* EOF/err before header */
+		/* Prime: feed until the sequence header parses.
+		 * Three safety nets, because vpu_DecGetInitialInfo can sit
+		 * inside libvpu indefinitely waiting on a VPU IRQ that never
+		 * fires after a poorly-closed prior stream:
+		 *   1. Try-count cap (64): only counts our loop iterations.
+		 *   2. SO_RCVTIMEO=5s on sock: recv times out -> feed=-1 -> break.
+		 *   3. SIGALRM(5s): kills the process if the library itself
+		 *      hangs (the only thing that breaks an in-library wait).
+		 * camera.c respawns us either way; the user sees ~2-7s of
+		 * reconnect latency in the rare degraded case. */
+		alarm(5);
+		int prime_tries = 0;
+		while (!inited && prime_tries++ < 64) {
+			if (feed(h, 1) <= 0) break;            /* EOF/err/timeout */
+			g_progress = 1;   /* fed some bytes -- main is alive */
 			vpu_DecSetEscSeqInit(h, 1);
 			if (vpu_DecGetInitialInfo(h, &ii) == RETCODE_SUCCESS) inited = 1;
 			vpu_DecSetEscSeqInit(h, 0);
 		}
-		if (!inited) { vpu_DecClose(h); close(sock); continue; }
+		alarm(0);
+		if (!inited) {
+			printf("prime failed (%d tries, no sequence header); reconnecting\n",
+			       prime_tries);
+			fflush(stdout);
+			vpu_DecClose(h); close(sock); continue;
+		}
 		printf("Video: %dx%d minFB=%d\n", ii.picWidth, ii.picHeight, ii.minFrameBufferCount);
 		fflush(stdout);
 
@@ -440,6 +568,10 @@ int main(int argc, char **argv)
 				vpu_DecClrDispFlag(h, idx);
 				ms_dec += (t1 - t0); ms_prp += (t2 - t1); ms_blit += (t3 - t2);
 				frames++; f_window++;
+				/* Every successful frame is progress. (Setting once per
+				 * frame is cheap and ensures even slow streams keep the
+				 * heartbeat fresh.) */
+				g_progress = 1;
 				if (f_window >= 60) {
 					long el = now_ms() - t_window;
 					printf("%.1f fps over %ld frames%s | per-frame avg: dec %ldms prp %ldms blit %ldms\n",
@@ -456,8 +588,18 @@ int main(int argc, char **argv)
 		}
 disc:
 		printf("client gone (%d frames); re-listening\n", frames); fflush(stdout);
+		g_active = 0;   /* back to accept idle */
 		vpu_DecClose(h);
 		close(sock); sock = -1;
+		/* NOTE: do NOT call IOSysSWReset here. The kernel reset halts
+		 * the BIT processor + clears registers; libvpu's in-process
+		 * state still believes the firmware is loaded and the next
+		 * vpu_DecOpen writes to a dead chip -> no decode, no IRQ.
+		 * The kernel does a last-close reset (vpu_release) so a fresh
+		 * process always gets a clean VPU; for in-process reconnects
+		 * we rely on the heartbeat watchdog (camera.c) to SIGKILL us
+		 * if a reconnect-prime hangs, which triggers vpu_release ->
+		 * reset -> respawn with clean state. */
 	}
 	return 0;
 }

@@ -88,6 +88,7 @@ struct vpu_prp_convert {
 #define BIT_CODE_DOWN			0x004
 #define	BIT_INT_CLEAR			0x00C
 #define	BIT_INT_STATUS			0x010
+#define	BIT_CODE_RESET			0x014  /* W=1: hold BIT proc in reset */
 
 #define BIT_WORK_CTRL_BUF_BASE		0x100
 #define BIT_WORK_CTRL_BUF_REG(i)	(BIT_WORK_CTRL_BUF_BASE + i * 4)

@@ -963,9 +963,33 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 		}
 	case VPU_IOC_SYS_SW_RESET:
 		{
-			if (vpu_plat->reset)
+			/* Hardware reset of the Codadx6.  Without this between
+			 * sessions, libvpu's vpu_DecGetInitialInfo on the next
+			 * decoder open can hang inside the wait-for-IRQ -- the
+			 * chip is stuck in whatever mid-decode state the prior
+			 * session left it in. (vpu_plat->reset is the original
+			 * BSP path, which doesn't exist on Toon since we bypass
+			 * platform_device; we fall through to the direct reg
+			 * write below.) */
+			if (vpu_plat && vpu_plat->reset) {
 				vpu_plat->reset();
-
+			} else if (vpu_base) {
+				vpu_clk_force_on();
+				/* Halt the BIT processor, pulse software reset,
+				 * clear pending IRQ.  Codadx6 latches reset on
+				 * a write of 1; a few cycles later the chip is
+				 * idle and ready for a fresh code download. */
+				WRITE_REG(0, BIT_CODE_RUN);
+				WRITE_REG(1, BIT_CODE_RESET);
+				udelay(10);
+				WRITE_REG(0, BIT_CODE_RESET);
+				WRITE_REG(1, BIT_INT_CLEAR);
+				/* Drop the codec_done flag -- a stale "decode
+				 * finished" from before the reset must not
+				 * satisfy the next wait. */
+				codec_done = 0;
+				printk(KERN_INFO "mxc_vpu: hardware reset issued\n");
+			}
 			break;
 		}
 	case VPU_IOC_REG_DUMP:
@@ -989,6 +1013,21 @@ static int vpu_release(struct inode *inode, struct file *filp)
 {
 	spin_lock(&vpu_lock);
 	if (open_count > 0 && !(--open_count)) {
+		/* Last close -- hard-reset the VPU so the next process that
+		 * opens /dev/mxc_vpu and runs vpu_Init starts from a clean
+		 * state. Without this the chip is left in whatever (possibly
+		 * mid-decode) state the prior session ended in, and the
+		 * next vpu_DecGetInitialInfo can hang forever waiting on a
+		 * BIT-processor IRQ that will never fire. */
+		if (vpu_base) {
+			vpu_clk_force_on();
+			WRITE_REG(0, BIT_CODE_RUN);
+			WRITE_REG(1, BIT_CODE_RESET);
+			udelay(10);
+			WRITE_REG(0, BIT_CODE_RESET);
+			WRITE_REG(1, BIT_INT_CLEAR);
+			codec_done = 0;
+		}
 		vpu_free_buffers();
 
 		/* Free shared memory when vpu device is idle (share_mem is now

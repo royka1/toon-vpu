@@ -193,6 +193,15 @@ static int feed_skip_to_latest(DecHandle h)
 
 int main(int argc, char **argv)
 {
+	/* Install signal handlers FIRST. The parent (camera.c) may send
+	 * SIGUSR1 immediately after fork+exec (post-respawn re-arm if the
+	 * user had the camera tile open when the prior child died); if
+	 * that signal arrives before we install the handler, the default
+	 * action is to terminate. on_sigusr1/2 are pure flag-setters --
+	 * harmless to install before we know whether --warm was passed. */
+	signal(SIGUSR1, on_sigusr1);
+	signal(SIGUSR2, on_sigusr2);
+
 	int port = 5000;
 	/* Optional --rect X Y W H: render at (X,Y) sized W x H instead of the
 	 * decoded-and-centred default. eMMA PrP does the resize bilinearly in
@@ -236,6 +245,9 @@ int main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGALRM, on_sigalrm);
+	/* SIGUSR1/2 are installed at the very top of main, before arg
+	 * parsing -- see comment there. They're flag-setters and harmless
+	 * even when --warm wasn't passed. */
 
 	/* Start the heartbeat thread BEFORE anything that can hang. The
 	 * watchdog in camera.c only kills us if heartbeat goes stale, so
@@ -246,10 +258,6 @@ int main(int argc, char **argv)
 			pthread_detach(hb);
 		else
 			fprintf(stderr, "heartbeat thread failed; watchdog will misfire\n");
-	}
-	if (g_warm) {
-		signal(SIGUSR1, on_sigusr1);   /* show:  unmask blits at next I */
-		signal(SIGUSR2, on_sigusr2);   /* hide:  back to warm/no-blit */
 	}
 	setpriority(PRIO_PROCESS, 0, 10);
 

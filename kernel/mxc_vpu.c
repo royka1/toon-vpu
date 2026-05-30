@@ -77,17 +77,37 @@ static struct device *vpu_dev;
 
 static void __iomem *vpu_base;
 static void __iomem *ccm_base;	/* i.MX27 CCM, for forcing VPU clock gates */
+static void __iomem *sdramc_base;	/* i.MX27 SDRAM controller diagnostics */
+static void __iomem *m3if_base;	/* i.MX27 M3IF diagnostics */
+static void __iomem *max_base;	/* i.MX27 MAX/AHB arbitration diagnostics; unsafe to read on Toon */
+static void __iomem *pp_base;	/* i.MX27 eMMA PP (post-decode YUV->RGB) */
 static void __iomem *prp_base;	/* i.MX27 eMMA PrP (HW YUV->RGB + resize) */
+static int pp_irq_num;
+static int pp_done;
+static int pp_status;
+static wait_queue_head_t pp_queue;
+static DEFINE_MUTEX(pp_lock);
+static struct vpu_pp_csc pp_csc = {
+	.c0 = 0x95, .c1 = 0xcc, .c2 = 0x32,
+	.c3 = 0x68, .c4 = 0x104, .x0 = 1,
+};
 static int prp_irq_num;
 static int prp_done;
 static wait_queue_head_t prp_queue;
 static DEFINE_MUTEX(prp_lock);
+static int allow_prp;
+static int iram_size;
+static int prp_disabled_warned;
 static int vpu_irq;
 static u32 phy_vpu_base_addr;
 static struct mxc_vpu_platform_data *vpu_plat;
 
 /* IRAM setting */
 static struct iram_setting iram;
+static unsigned long iram_alloc_size;
+
+#define MX27_SDRAMC_ESDCFG0	0x10
+#define MX27_SDRAMC_ESDCFG0_LHD	(1 << 5)
 
 /* implement the blocking ioctl */
 static int codec_done;
@@ -107,6 +127,42 @@ static inline void vpu_clk_force_on(void)
 	if (ccm_base)
 		__raw_writel(__raw_readl(ccm_base + 0x24) | (1 << 6) | (1 << 16),
 			     ccm_base + 0x24);
+}
+
+static void vpu_dump_regs(const char *name, void __iomem *base, unsigned int bytes)
+{
+	unsigned int off;
+
+	if (!base) {
+		printk(KERN_WARNING "vpu: %s not mapped\n", name);
+		return;
+	}
+	for (off = 0; off < bytes; off += 16) {
+		printk(KERN_INFO "vpu: %s+0x%02x: %08x %08x %08x %08x\n",
+		       name, off,
+		       __raw_readl(base + off + 0x0),
+		       __raw_readl(base + off + 0x4),
+		       __raw_readl(base + off + 0x8),
+		       __raw_readl(base + off + 0xc));
+	}
+}
+
+static void vpu_dump_bus_regs(const char *tag)
+{
+	u32 esdcfg0;
+
+	printk(KERN_INFO "vpu: bus diagnostics (%s)\n", tag);
+	if (sdramc_base) {
+		esdcfg0 = __raw_readl(sdramc_base + MX27_SDRAMC_ESDCFG0);
+		printk(KERN_INFO "vpu: SDRAMC ESDCFG0=0x%08x LHD=%u "
+		       "(bit5 set means latency hiding disabled)\n",
+		       esdcfg0, !!(esdcfg0 & MX27_SDRAMC_ESDCFG0_LHD));
+	}
+	vpu_dump_regs("SDRAMC", sdramc_base, 0x40);
+	vpu_dump_regs("M3IF", m3if_base, 0x40);
+	/* MAX exists at MX27_MAX_BASE_ADDR, but probing it caused an external
+	 * abort on Toon. Keep the mapping variable for future targeted work, but
+	 * do not dump it blindly. */
 }
 
 /*
@@ -259,6 +315,435 @@ static int vpu_free_buffers(void)
 	return 0;
 }
 
+/* Force eMMA clock gates on (emma_clk=PCCR0 bit27, emma_clk1=PCCR1 bit18). */
+static inline void emma_force_clk_on(void)
+{
+	if (ccm_base) {
+		__raw_writel(__raw_readl(ccm_base + 0x20) | (1 << 27), ccm_base + 0x20);
+		__raw_writel(__raw_readl(ccm_base + 0x24) | (1 << 18), ccm_base + 0x24);
+	}
+}
+
+/*
+ * ============================================================================
+ * i.MX27 eMMA PP: post-decode YUV420 -> RGB565.  This is the SoC block that
+ * was intended to consume decoded YUV frames before display.
+ * ============================================================================
+ */
+#define PPW(o, v)	__raw_writel((v), pp_base + (o))
+#define PPR(o)		__raw_readl(pp_base + (o))
+
+#define PP_CNTL			0x00
+#define PP_INTRCNTL		0x04
+#define PP_INTRSTATUS		0x08
+#define PP_SOURCE_Y_PTR		0x0c
+#define PP_SOURCE_CB_PTR	0x10
+#define PP_SOURCE_CR_PTR	0x14
+#define PP_DEST_RGB_PTR		0x18
+#define PP_QUANTIZER_PTR	0x1c
+#define PP_PROCESS_PARA		0x20
+#define PP_FRAME_WIDTH		0x24
+#define PP_DISPLAY_WIDTH	0x28
+#define PP_IMAGE_SIZE		0x2c
+#define PP_DEST_FRAME_FMT_CNTL	0x30
+#define PP_RESIZE_INDEX		0x34
+#define PP_CSC_COEF_123		0x38
+#define PP_CSC_COEF_4		0x3c
+#define PP_RESIZE_COEF_TBL	0x100
+
+#define PP_CNTL_CSC_OUT_RGB565	(2 << 10)	/* bits[11:10]=10 -> 16bpp */
+#define PP_CNTL_CSC_OUT_RGB32	(3 << 10)	/* bits[11:10]=11 -> 32bpp (24<<7 per mx27_pp.c) */
+#define PP_CNTL_SWRST		(1 << 8)
+#define PP_CNTL_CSC_TABLE_A0	(1 << 5)
+#define PP_CNTL_CSCEN		(1 << 4)
+#define PP_CNTL_PP_EN		(1 << 0)
+
+#define PP_INTR_ERR		(1 << 2)
+#define PP_INTR_FRAME		(1 << 0)
+
+#define PP_RESIZE_COEF(w, n, op)	(((w) << 3) | ((n) << 1) | (op))
+#define PP_SKIP			1
+#define PP_TBL_MAX		40
+#define PP_BC_NXT		2
+#define PP_BC_COEF		5
+#define PP_SZ_COEF		(1 << PP_BC_COEF)
+#define PP_SZ_NXT		(1 << PP_BC_NXT)
+
+static irqreturn_t pp_irq_handler(int irq, void *dev_id)
+{
+	u32 st = PPR(PP_INTRSTATUS) & (PP_INTR_ERR | PP_INTR_FRAME);
+
+	if (!st)
+		return IRQ_HANDLED;
+
+	PPW(PP_INTRSTATUS, st);
+	pp_status = st;
+	pp_done = 1;
+	wake_up_interruptible(&pp_queue);
+	return IRQ_HANDLED;
+}
+
+static int pp_csc_valid(const struct vpu_pp_csc *csc)
+{
+	if (csc->c0 > 0xff || csc->c1 > 0xff || csc->c2 > 0xff ||
+	    csc->c3 > 0xff || csc->c4 > 0x1ff || csc->x0 > 1)
+		return 0;
+	return 1;
+}
+
+static unsigned int pp_gcd(unsigned int x, unsigned int y)
+{
+	unsigned int k;
+
+	if (x < y) {
+		k = x;
+		x = y;
+		y = k;
+	}
+
+	while ((k = x % y)) {
+		x = y;
+		y = k;
+	}
+
+	return y;
+}
+
+static int pp_scale_0d(u16 *tbl, int k, int coeff, int base, int nxt)
+{
+	if (k >= PP_TBL_MAX)
+		return -ENOSPC;
+
+	coeff = ((coeff << PP_BC_COEF) + (base >> 1)) / base;
+
+	/*
+	 * Valid PP weights are 0, 2..30 and 31. 31 is treated by the block as
+	 * 32, so avoid generating raw 31 except for the forced 1:1 case.
+	 */
+	if (coeff >= PP_SZ_COEF - 1)
+		coeff--;
+	else if (coeff == 1)
+		coeff++;
+	coeff <<= PP_BC_NXT;
+
+	if (nxt < PP_SZ_NXT) {
+		tbl[k++] = (coeff | nxt) << 1 | 1;
+	} else {
+		coeff |= PP_SKIP;
+		tbl[k++] = coeff << 1 | 1;
+		nxt -= PP_SKIP;
+		do {
+			if (k >= PP_TBL_MAX)
+				return -ENOSPC;
+			coeff = (nxt > PP_SKIP) ? PP_SKIP : nxt;
+			tbl[k++] = coeff << 1;
+		} while ((nxt -= PP_SKIP) > 0);
+	}
+
+	return k;
+}
+
+/*
+ * Build one PP resize coefficient sequence. This is the Freescale mx27_pp.c
+ * algorithm trimmed to exact ratios; callers reduce input/output dimensions
+ * before entry so common video sizes fit in the 40-entry hardware table.
+ */
+static int pp_scale_1d(u16 *tbl, int inv, int outv, int k)
+{
+	int v;
+	int coeff;
+	int nxt;
+
+	if (inv == outv)
+		return pp_scale_0d(tbl, k, 1, 1, 1);
+
+	v = 0;
+	if (inv < outv) {
+		do {
+			coeff = outv - v;
+			v += inv;
+			if (v >= outv) {
+				v -= outv;
+				nxt = 1;
+			} else {
+				nxt = 0;
+			}
+			k = pp_scale_0d(tbl, k, coeff, outv, nxt);
+			if (k < 0)
+				return k;
+		} while (v);
+	} else if (inv >= 2 * outv) {
+		if ((inv != 2 * outv) && (inv != 4 * outv))
+			return -EOPNOTSUPP;
+		coeff = inv - 2 * outv;
+		v = 0;
+		do {
+			v += coeff;
+			nxt = 2;
+			while (v >= outv) {
+				v -= outv;
+				nxt++;
+			}
+			k = pp_scale_0d(tbl, k, 1, 2, nxt);
+			if (k < 0)
+				return k;
+		} while (v);
+	} else {
+		int in_pos_inc = 2 * outv;
+		int out_pos = inv;
+		int out_pos_inc = 2 * inv;
+		int init_carry = inv - outv;
+		int carry = init_carry;
+
+		v = outv + in_pos_inc;
+		do {
+			coeff = v - out_pos;
+			out_pos += out_pos_inc;
+			carry += out_pos_inc;
+			for (nxt = 0; v < out_pos; nxt++) {
+				v += in_pos_inc;
+				carry -= in_pos_inc;
+			}
+			k = pp_scale_0d(tbl, k, coeff, in_pos_inc, nxt);
+			if (k < 0)
+				return k;
+		} while (carry != init_carry);
+	}
+
+	return k;
+}
+
+static int pp_build_resize(u16 *tbl, unsigned int src_w, unsigned int src_h,
+			   unsigned int dst_w, unsigned int dst_h,
+			   u32 *index_reg, int *tbl_len)
+{
+	unsigned int g;
+	int hn, hd, vn, vd;
+	int hlen;
+	int vlen;
+
+	g = pp_gcd(src_w, dst_w);
+	hn = src_w / g;
+	hd = dst_w / g;
+	g = pp_gcd(src_h, dst_h);
+	vn = src_h / g;
+	vd = dst_h / g;
+
+	/* PP hardware ratio limits (from Freescale mx27_pp.c scale_1d_smart):
+	 * upscale max 4:1, downscale max 2:1 (or exact 4:1). */
+	if (hd > 4 * hn || vd > 4 * vn)
+		return -EOPNOTSUPP;
+	if ((hn > 2 * hd && hn != 4 * hd) || (vn > 2 * vd && vn != 4 * vd))
+		return -EOPNOTSUPP;
+
+	hlen = pp_scale_1d(tbl, hn, hd, 0);
+	if (hlen <= 0)
+		return hlen ? hlen : -EOPNOTSUPP;
+
+	if (hn == vn && hd == vd) {
+		vlen = hlen;
+		*index_reg = ((hlen - 1) << 16) | (vlen - 1);
+	} else {
+		vlen = pp_scale_1d(tbl, vn, vd, hlen);
+		if (vlen <= hlen)
+			return vlen < 0 ? vlen : -EOPNOTSUPP;
+		*index_reg = ((hlen - 1) << 16) | (hlen << 8) | (vlen - 1);
+	}
+
+	*tbl_len = vlen;
+	return 0;
+}
+
+/*
+ * Full PP hardware reset.  Kills any in-progress DMA, restores the PP to its
+ * power-on register state (PP_CNTL == 0x876).  Must be called with the eMMA
+ * clock forced on.  Returns 0 on success, -ETIME on timeout, -EIO on bad
+ * reset value.
+ */
+static int pp_hw_reset(void)
+{
+	int i;
+
+	PPW(PP_CNTL, PP_CNTL_SWRST);
+	for (i = 0; i < 1000; i++) {
+		if (!(PPR(PP_CNTL) & PP_CNTL_SWRST))
+			break;
+		udelay(1);
+	}
+	if (i == 1000)
+		return -ETIME;
+	if (PPR(PP_CNTL) != 0x876) {
+		printk(KERN_WARNING "vpu: PP reset value 0x%08x != 0x876\n",
+		       PPR(PP_CNTL));
+		return -EIO;
+	}
+	PPW(PP_INTRSTATUS, PP_INTR_ERR | PP_INTR_FRAME);
+	return 0;
+}
+
+/* One-shot hardware YUV420(planar) -> RGB565 with PP resize. */
+static int pp_convert(struct vpu_pp_convert *c)
+{
+	u16 resize_tbl[PP_TBL_MAX];
+	u32 ysz;
+	u32 src_layout_h;
+	u32 fmt;
+	u32 cntl;
+	u32 resize_index;
+	u32 dst_bpp;
+	u32 dst_bytes;
+	int resize_len;
+	int i;
+	int rc;
+
+	dst_bpp = c->dst_bpp ? c->dst_bpp : 16;
+	/* PP mode 00 (4-byte pixel) works for 1:1 but hangs with resize
+	 * (the scaler is incompatible with this mode).  Reject early so
+	 * the fallback path handles upscale without hanging the PP. */
+	if (dst_bpp == 32 && (c->src_w != c->dst_w || c->src_h != c->dst_h))
+		return -EOPNOTSUPP;
+	dst_bytes = dst_bpp / 8;
+	if (!pp_base)
+		return -ENODEV;
+	if (c->src_w < 32 || c->src_h < 32 || c->dst_w < 8 || c->dst_h < 8) {
+		printk(KERN_DEBUG "vpu: PP size check fail src=%ux%u dst=%ux%u\n",
+		       c->src_w, c->src_h, c->dst_w, c->dst_h);
+		return -EINVAL;
+	}
+	if ((c->src_w & 7) || (c->src_h & 7) || (c->src_stride & 7)) {
+		printk(KERN_DEBUG "vpu: PP src align fail src=%ux%u stride=%u\n",
+		       c->src_w, c->src_h, c->src_stride);
+		return -EINVAL;
+	}
+	if ((c->dst_w & 1) || (c->dst_h & 1) || (c->dst_stride & (dst_bytes - 1))) {
+		printk(KERN_DEBUG "vpu: PP dst align fail dst=%ux%u stride=%u bpp=%u\n",
+		       c->dst_w, c->dst_h, c->dst_stride, dst_bpp);
+		return -EINVAL;
+	}
+	if ((c->src_y | c->dst_rgb) & 3) {
+		printk(KERN_DEBUG "vpu: PP addr align fail src=0x%x dst=0x%x\n",
+		       c->src_y, c->dst_rgb);
+		return -EINVAL;
+	}
+	if (c->src_stride < c->src_w || c->dst_stride < c->dst_w * dst_bytes) {
+		printk(KERN_DEBUG "vpu: PP stride fail src_stride=%u src_w=%u dst_stride=%u dst_w=%u bpp=%u\n",
+		       c->src_stride, c->src_w, c->dst_stride, c->dst_w, dst_bpp);
+		return -EINVAL;
+	}
+	rc = pp_build_resize(resize_tbl, c->src_w, c->src_h, c->dst_w, c->dst_h,
+			     &resize_index, &resize_len);
+	if (rc) {
+		printk(KERN_DEBUG "vpu: PP resize fail src=%ux%u dst=%ux%u rc=%d\n",
+		       c->src_w, c->src_h, c->dst_w, c->dst_h, rc);
+		return rc == -ENOSPC ? -EOPNOTSUPP : rc;
+	}
+
+	mutex_lock(&pp_lock);
+	emma_force_clk_on();
+
+	rc = pp_hw_reset();
+	if (rc) {
+		mutex_unlock(&pp_lock);
+		return rc;
+	}
+
+	/*
+	 * The VPU lays out Cb/Cr after the 16-line-aligned Y plane, while PP
+	 * should process only the visible height. Deriving chroma addresses
+	 * from c->src_h corrupts the first chroma rows for heights like 360.
+	 */
+	src_layout_h = (c->src_h + 15) & ~15;
+	ysz = c->src_stride * src_layout_h;
+	PPW(PP_SOURCE_Y_PTR, c->src_y);
+	PPW(PP_SOURCE_CB_PTR, c->src_y + ysz);
+	PPW(PP_SOURCE_CR_PTR, c->src_y + ysz + (ysz >> 2));
+	PPW(PP_DEST_RGB_PTR, c->dst_rgb);
+	PPW(PP_QUANTIZER_PTR, c->src_qp);
+
+	PPW(PP_PROCESS_PARA, (c->src_w << 16) | c->src_h);
+	PPW(PP_FRAME_WIDTH, c->src_stride);
+	PPW(PP_DISPLAY_WIDTH, c->dst_stride);
+	PPW(PP_IMAGE_SIZE, (c->dst_w << 16) | c->dst_h);
+
+	if (dst_bpp == 32) {
+		/* Toon fb custom 32bpp: 6-bit components at R@18 G@10 B@2.
+		 * PP hardware rejects >6-bit component widths, so standard
+		 * 8-bit BGR32 is not an option. */
+		fmt = (18 << 26) | (10 << 21) | (2 << 16) |
+		      (6 << 8) | (6 << 4) | 6;
+	} else {
+		fmt = (11 << 26) | (5 << 21) | (0 << 16) |
+		      (5 << 8) | (6 << 4) | 5;
+	}
+	PPW(PP_DEST_FRAME_FMT_CNTL, fmt);
+
+	PPW(PP_CSC_COEF_123, (pp_csc.c0 << 24) | (pp_csc.c1 << 16) |
+			     (pp_csc.c2 << 8) | pp_csc.c3);
+	PPW(PP_CSC_COEF_4, (pp_csc.x0 ? (1 << 9) : 0) | pp_csc.c4);
+
+	PPW(PP_RESIZE_INDEX, resize_index);
+	for (i = 0; i < resize_len; i++)
+		PPW(PP_RESIZE_COEF_TBL + i * 4, resize_tbl[i]);
+
+	PPW(PP_INTRCNTL, PP_INTR_ERR | PP_INTR_FRAME);
+	pp_status = 0;
+	pp_done = 0;
+
+	/* Read-modify-write PP_CNTL matching Freescale pphw_cfg():
+	 * EN_MASK=0x36 clears bits 1,2,4,5 (operation bits); bit 2 in
+	 * particular conflicts with CSC when left at reset value 1. */
+	cntl = PPR(PP_CNTL) & ~(c->src_qp ? 0x34 : 0x36);
+	if (c->src_qp)
+		cntl |= 0x02;	/* EN_DEBLOCK */
+	/* auto-derive rgb_resolution (mx27_pp.c pphw_cfg lines 962-984).
+	 * Mode 00 (bits[11:10]=00) is 32bpp/4-byte-per-pixel output;
+	 * mode 11 (bits[11:10]=11) is 24bpp/3-byte-per-pixel output.
+	 * Freescale only uses 11 but the manual says 00 is also 32bpp.
+	 * We use 00 so the output stride matches the Toon 4-byte fb. */
+	{
+		u32 w, w2;
+		int red_off = (fmt >> 26) & 0x3f;
+		int grn_off = (fmt >> 21) & 0x1f;
+		int blu_off = (fmt >> 16) & 0x1f;
+		int red_wid = (fmt >> 8) & 0xf;
+		int grn_wid = (fmt >> 4) & 0xf;
+		int blu_wid = fmt & 0xf;
+		w = red_off + red_wid;
+		w2 = blu_off + blu_wid; if (w < w2) w = w2;
+		w2 = grn_off + grn_wid; if (w < w2) w = w2;
+		cntl &= ~0xC00;
+		if (dst_bpp == 32) {
+			/* mode 00: 32bpp, 4-byte output pixel */
+		} else if (w > 16) {
+			cntl |= (24 << 7);  /* mode 11: 24bpp */
+		} else if (w > 8) {
+			cntl |= (16 << 7);  /* mode 10: 16bpp */
+		} else {
+			cntl |= (8 << 7);   /* mode 01: 8bpp */
+		}
+	}
+	cntl |= PP_CNTL_CSCEN;
+	cntl |= PP_CNTL_CSC_TABLE_A0 | PP_CNTL_PP_EN;
+	PPW(PP_CNTL, cntl);
+
+	rc = wait_event_interruptible_timeout(pp_queue, pp_done != 0,
+					      msecs_to_jiffies(200));
+	if (rc <= 0) {
+		printk(KERN_WARNING "vpu: PP timed out; resetting\n");
+		pp_hw_reset();
+		mutex_unlock(&pp_lock);
+		return rc < 0 ? rc : -ETIME;
+	}
+	if (pp_status & PP_INTR_ERR) {
+		printk(KERN_WARNING "vpu: PP error interrupt; resetting\n");
+		pp_hw_reset();
+		mutex_unlock(&pp_lock);
+		return -EIO;
+	}
+	mutex_unlock(&pp_lock);
+	return 0;
+}
+
 /*
  * ============================================================================
  * i.MX27 eMMA PrP: hardware YUV420 -> RGB565 (+ resize), offloads CPU CSC.
@@ -292,7 +777,9 @@ static int vpu_free_buffers(void)
 /* PRP_CNTL bits */
 #define PRP_CNTL_CH1EN			(1 << 0)
 #define PRP_CNTL_IN_YUV420		0
+#define PRP_CNTL_IN_RGB16		(1 << 4)	/* RGB565 input, bypass CSC */
 #define PRP_CNTL_CH1_RGB16		(1 << 5)
+#define PRP_CNTL_CH1_RGB32		(2 << 5)	/* bits [6:5] = 2 */
 #define PRP_CNTL_RST			(1 << 12)
 #define PRP_CNTL_RSTVAL			0x28
 /* PRP_INTRCNTL / status bits */
@@ -300,9 +787,13 @@ static int vpu_free_buffers(void)
 #define PRP_INTRCNTL_CH1WERR		(1 << 1)
 #define PRP_INTRCNTL_CH1FC		(1 << 3)
 #define PRP_INTRCNTL_LBOVF		(1 << 7)
-/* pixel format codes */
-#define PRP_PIXIN_YUV420		0
+/* pixel format codes — output (CH1) */
 #define PRP_PIX1_RGB565			0x2CA00565
+#define PRP_PIX1_RGB888			0x41000888
+#define PRP_PIX1_TOON32			0x49420666	/* R@18/6 G@10/6 B@2/6 */
+/* pixel format codes — input */
+#define PRP_PIXIN_YUV420		0
+#define PRP_PIXIN_RGB565		0x2CA00565	/* RGB565 input */
 
 /* scaler (ported verbatim from mx27_prphw.c) */
 #define BC_COEF		3
@@ -558,13 +1049,9 @@ static void prp_set_scaler(int dir, scale_t *scale)
 	PRPW(off + 8, valid);
 }
 
-/* Force the eMMA clock gates on (emma_clk=PCCR0 bit27, emma_clk1=PCCR1 bit18). */
 static inline void prp_force_clk_on(void)
 {
-	if (ccm_base) {
-		__raw_writel(__raw_readl(ccm_base + 0x20) | (1 << 27), ccm_base + 0x20);
-		__raw_writel(__raw_readl(ccm_base + 0x24) | (1 << 18), ccm_base + 0x24);
-	}
+	emma_force_clk_on();
 }
 
 static irqreturn_t prp_irq_handler(int irq, void *dev_id)
@@ -578,18 +1065,27 @@ static irqreturn_t prp_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-/* One-shot hardware YUV420(planar) -> RGB565 (+resize). */
+/* One-shot hardware YUV420(planar) -> RGB565/888 (+resize). */
 static int prp_convert(struct vpu_prp_convert *c)
 {
 	scale_t sw, sh;
 	unsigned short outw = 0, outh = 0;
 	u32 sz;
+	u32 dst_bpp;
+	u32 ch1_pix;
+	u32 ch1_rgb;
+	u32 in_bits;
+	int in_rgb;
 	int i, rc;
+
+	in_rgb = (c->in_fmt != 0);
 
 	if (!prp_base)
 		return -ENODEV;
 	if (c->src_w < 32 || c->src_h < 32 || c->dst_w < 8 || c->dst_h < 8)
 		return -EINVAL;
+
+	dst_bpp = c->dst_bpp ? c->dst_bpp : 16;
 
 	memset(&sw, 0, sizeof(sw)); sw.algo = ALGO_AUTO;
 	memset(&sh, 0, sizeof(sh)); sh.algo = ALGO_AUTO;
@@ -597,7 +1093,7 @@ static int prp_convert(struct vpu_prp_convert *c)
 		return -EINVAL;
 	if (prp_scale(&sh, c->src_h, c->dst_h, c->src_h, &outh, SCALE_RETRY) < 0)
 		return -EINVAL;
-	outw &= ~1;	/* RGB16 width must be even */
+	outw &= ~1;	/* width must be even for both 16bpp and 32bpp */
 
 	mutex_lock(&prp_lock);
 	prp_force_clk_on();
@@ -610,22 +1106,36 @@ static int prp_convert(struct vpu_prp_convert *c)
 		udelay(1);
 	}
 
-	/* CSC: studio-range BT.601 YUV -> RGB */
+	/* CSC coefficients always written (Freescale reference does it for
+	 * both YUV and RGB input; the IN_RGB bit in CNTL tells the block
+	 * whether to treat them as YUV2RGB or RGB2YUV). */
 	PRPW(PRP_CSC_COEF_012, 0x12A66032);
 	PRPW(PRP_CSC_COEF_345, 0x0D082000);
 	PRPW(PRP_CSC_COEF_678, 0x80000000);
 
-	/* input: YUV420 planar */
-	PRPW(PRP_SRC_PIXEL_FORMAT_CNTL, PRP_PIXIN_YUV420);
+	/* input setup: YUV420 planar or RGB single-plane */
+	PRPW(PRP_SRC_PIXEL_FORMAT_CNTL, in_rgb ? c->in_fmt : PRP_PIXIN_YUV420);
 	PRPW(PRP_SOURCE_FRAME_SIZE, (c->src_w << 16) | c->src_h);
 	PRPW(PRP_SOURCE_LINE_STRIDE, c->src_stride);
 	PRPW(PRP_SOURCE_Y_PTR, c->src_y);
-	sz = c->src_stride * c->src_h;
-	PRPW(PRP_SOURCE_CB_PTR, c->src_y + sz);
-	PRPW(PRP_SOURCE_CR_PTR, c->src_y + sz + (sz >> 2));
+	if (in_rgb) {
+		PRPW(PRP_SOURCE_CB_PTR, c->src_y);
+		PRPW(PRP_SOURCE_CR_PTR, c->src_y);
+	} else {
+		sz = c->src_stride * c->src_h;
+		PRPW(PRP_SOURCE_CB_PTR, c->src_y + sz);
+		PRPW(PRP_SOURCE_CR_PTR, c->src_y + sz + (sz >> 2));
+	}
 
-	/* output CH1: RGB565 */
-	PRPW(PRP_CH1_PIXEL_FORMAT_CNTL, PRP_PIX1_RGB565);
+	/* output CH1 — 16bpp or Toon 32bpp */
+	if (dst_bpp == 32) {
+		ch1_pix = PRP_PIX1_TOON32;
+		ch1_rgb = PRP_CNTL_CH1_RGB32;
+	} else {
+		ch1_pix = PRP_PIX1_RGB565;
+		ch1_rgb = PRP_CNTL_CH1_RGB16;
+	}
+	PRPW(PRP_CH1_PIXEL_FORMAT_CNTL, ch1_pix);
 	PRPW(PRP_CH1_OUT_IMAGE_SIZE, (outw << 16) | outh);
 	PRPW(PRP_CH1_LINE_STRIDE, c->dst_stride);
 	PRPW(PRP_DEST_RGB1_PTR, c->dst_rgb);
@@ -637,13 +1147,18 @@ static int prp_convert(struct vpu_prp_convert *c)
 	     PRP_INTRCNTL_CH1WERR | PRP_INTRCNTL_LBOVF);
 
 	prp_done = 0;
-	PRPW(PRP_CNTL, PRP_CNTL_IN_YUV420 | PRP_CNTL_CH1_RGB16 | PRP_CNTL_CH1EN);
+	in_bits = in_rgb ? PRP_CNTL_IN_RGB16 : PRP_CNTL_IN_YUV420;
+	PRPW(PRP_CNTL, in_bits | ch1_rgb | PRP_CNTL_CH1EN);
 
 	rc = wait_event_interruptible_timeout(prp_queue, prp_done != 0,
 					      msecs_to_jiffies(200));
 	if (rc <= 0) {
 		PRPW(PRP_CNTL, PRPR(PRP_CNTL) & ~PRP_CNTL_CH1EN);
 		mutex_unlock(&prp_lock);
+		if (in_rgb)
+			printk(KERN_WARNING "vpu: PrP RGB->RGB timed out "
+			       "src=%ux%u dst=%ux%u in_fmt=0x%x\n",
+			       c->src_w, c->src_h, c->dst_w, c->dst_h, c->in_fmt);
 		return -ETIME;
 	}
 	mutex_unlock(&prp_lock);
@@ -767,7 +1282,6 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 			if (!wait_event_interruptible_timeout
 			    (vpu_queue, codec_done != 0,
 			     msecs_to_jiffies(timeout))) {
-				printk(KERN_WARNING "VPU blocking: timeout.\n");
 				ret = -ETIME;
 			} else if (signal_pending(current)) {
 				printk(KERN_WARNING
@@ -810,9 +1324,51 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 		{
 			struct vpu_prp_convert cvt;
 
+			if (!allow_prp) {
+				if (!prp_disabled_warned) {
+					prp_disabled_warned = 1;
+					printk(KERN_WARNING
+					       "vpu: PrP convert disabled; load mxc_vpu with allow_prp=1 to enable\n");
+				}
+				ret = -EOPNOTSUPP;
+				break;
+			}
 			if (copy_from_user(&cvt, (void __user *)arg, sizeof(cvt)))
 				return -EFAULT;
 			ret = prp_convert(&cvt);
+			break;
+		}
+	case VPU_IOC_PP_CONVERT:
+		{
+			struct vpu_pp_convert cvt;
+
+			if (copy_from_user(&cvt, (void __user *)arg, sizeof(cvt)))
+				return -EFAULT;
+			ret = pp_convert(&cvt);
+			break;
+		}
+	case VPU_IOC_PP_SET_CSC:
+		{
+			struct vpu_pp_csc csc;
+
+			if (copy_from_user(&csc, (void __user *)arg, sizeof(csc)))
+				return -EFAULT;
+			if (!pp_csc_valid(&csc))
+				return -EINVAL;
+			mutex_lock(&pp_lock);
+			pp_csc = csc;
+			mutex_unlock(&pp_lock);
+			break;
+		}
+	case VPU_IOC_PP_GET_CSC:
+		{
+			struct vpu_pp_csc csc;
+
+			mutex_lock(&pp_lock);
+			csc = pp_csc;
+			mutex_unlock(&pp_lock);
+			if (copy_to_user((void __user *)arg, &csc, sizeof(csc)))
+				return -EFAULT;
 			break;
 		}
 	case VPU_IOC_IRAM_SETTING:
@@ -825,26 +1381,13 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		}
 	case VPU_IOC_CLKGATE_SETTING:
-		{
-			u32 clkgate_en;
-
-			if (get_user(clkgate_en, (u32 __user *) arg))
-				return -EFAULT;
-
-			if (vpu_clk) {
-				if (clkgate_en) {
-					clk_enable(vpu_clk);
-					/* clk_enable doesn't set PCCR1 on this kernel */
-					__raw_writel(__raw_readl(ccm_base + 0x24)
-						     | (1 << 6) | (1 << 16),
-						     ccm_base + 0x24);
-				} else {
-					clk_disable(vpu_clk);
-				}
-			}
-
-			break;
-		}
+		/* The clock is forced on at init and before every register
+		 * access via vpu_clk_force_on() (direct CCM PCCR1 write).
+		 * The clock-framework enable/disable counting in the
+		 * library drifts on error paths and causes refcount
+		 * underflow WARNINGs at __clk_disable.  Ignore the ioctl
+		 * entirely -- the hardware clock stays on regardless. */
+		break;
 		case VPU_IOC_GET_SHARE_MEM:
 			{
 				/*
@@ -963,9 +1506,33 @@ static long vpu_ioctl(struct file *filp, unsigned int cmd,
 		}
 	case VPU_IOC_SYS_SW_RESET:
 		{
-			if (vpu_plat->reset)
+			/* Hardware reset of the Codadx6.  Without this between
+			 * sessions, libvpu's vpu_DecGetInitialInfo on the next
+			 * decoder open can hang inside the wait-for-IRQ -- the
+			 * chip is stuck in whatever mid-decode state the prior
+			 * session left it in. (vpu_plat->reset is the original
+			 * BSP path, which doesn't exist on Toon since we bypass
+			 * platform_device; we fall through to the direct reg
+			 * write below.) */
+			if (vpu_plat && vpu_plat->reset) {
 				vpu_plat->reset();
-
+			} else if (vpu_base) {
+				vpu_clk_force_on();
+				/* Halt the BIT processor, pulse software reset,
+				 * clear pending IRQ.  Codadx6 latches reset on
+				 * a write of 1; a few cycles later the chip is
+				 * idle and ready for a fresh code download. */
+				WRITE_REG(0, BIT_CODE_RUN);
+				WRITE_REG(1, BIT_CODE_RESET);
+				udelay(10);
+				WRITE_REG(0, BIT_CODE_RESET);
+				WRITE_REG(1, BIT_INT_CLEAR);
+				/* Drop the codec_done flag -- a stale "decode
+				 * finished" from before the reset must not
+				 * satisfy the next wait. */
+				codec_done = 0;
+				printk(KERN_INFO "mxc_vpu: hardware reset issued\n");
+			}
 			break;
 		}
 	case VPU_IOC_REG_DUMP:
@@ -989,6 +1556,21 @@ static int vpu_release(struct inode *inode, struct file *filp)
 {
 	spin_lock(&vpu_lock);
 	if (open_count > 0 && !(--open_count)) {
+		/* Last close -- hard-reset the VPU so the next process that
+		 * opens /dev/mxc_vpu and runs vpu_Init starts from a clean
+		 * state. Without this the chip is left in whatever (possibly
+		 * mid-decode) state the prior session ended in, and the
+		 * next vpu_DecGetInitialInfo can hang forever waiting on a
+		 * BIT-processor IRQ that will never fire. */
+		if (vpu_base) {
+			vpu_clk_force_on();
+			WRITE_REG(0, BIT_CODE_RUN);
+			WRITE_REG(1, BIT_CODE_RESET);
+			udelay(10);
+			WRITE_REG(0, BIT_CODE_RESET);
+			WRITE_REG(1, BIT_INT_CLEAR);
+			codec_done = 0;
+		}
 		vpu_free_buffers();
 
 		/* Free shared memory when vpu device is idle (share_mem is now
@@ -1118,17 +1700,33 @@ static int vpu_dev_probe(struct platform_device *pdev)
 	struct device *temp_class;
 	struct resource *res;
 	unsigned long addr = 0;
+	unsigned long requested_iram = 0;
 
 	vpu_plat = pdev->dev.platform_data;
 
-	if (vpu_plat && vpu_plat->iram_enable && vpu_plat->iram_size)
-		iram_alloc(vpu_plat->iram_size, &addr);
+	if (iram_size > 0)
+		requested_iram = iram_size;
+	else if (vpu_plat && vpu_plat->iram_enable && vpu_plat->iram_size)
+		requested_iram = vpu_plat->iram_size;
+
+	iram_alloc_size = 0;
+	if (requested_iram)
+		iram_alloc(requested_iram, &addr);
+	if (!addr && requested_iram && requested_iram <= 0xb000) {
+		addr = MX27_IRAM_BASE_ADDR;
+		printk(KERN_INFO "vpu: using fixed i.MX27 IRAM base because "
+		       "iram_alloc() is stubbed\n");
+	}
 	if (addr == 0)
 		iram.start = iram.end = 0;
 	else {
 		iram.start = addr;
-		iram.end = addr +  vpu_plat->iram_size - 1;
+		iram.end = addr + requested_iram - 1;
+		iram_alloc_size = requested_iram;
 	}
+	printk(KERN_INFO "vpu: IRAM %s start=0x%08x end=0x%08x size=0x%lx\n",
+	       iram_alloc_size ? "enabled" : "disabled",
+	       iram.start, iram.end, iram_alloc_size);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
@@ -1196,8 +1794,8 @@ static int vpu_dev_remove(struct platform_device *pdev)
 	free_irq(vpu_irq, &vpu_data);
 
 	iounmap(vpu_base);
-	if (vpu_plat && vpu_plat->iram_enable && vpu_plat->iram_size)
-		iram_free(iram.start,  vpu_plat->iram_size);
+	if (iram_alloc_size)
+		iram_free(iram.start, iram_alloc_size);
 
 	return 0;
 }
@@ -1280,6 +1878,23 @@ MODULE_PARM_DESC(hclk_max,
     "If 1, bump HCLK/VPU from ~103 MHz to ~155 MHz at module load "
     "(CSCR.AHB_PDF 2->1). Slightly above i.MX27 spec; revert via reboot.");
 
+static int clear_lhd = 0;
+module_param(clear_lhd, int, 0644);
+MODULE_PARM_DESC(clear_lhd,
+    "If 1, clear SDRAMC ESDCFG0 bit5 (LHD / Latency Hiding Disable) at module "
+    "load. This removes the old MPEG-4 FIFO-overrun workaround and may improve "
+    "H.264/VPU memory throughput. Reverts on reboot.");
+
+module_param(iram_size, int, 0644);
+MODULE_PARM_DESC(iram_size,
+    "Override platform IRAM allocation size for VPU. Use 0xb000 for CODA DX6 "
+    "experiments on i.MX27; default 0 keeps platform data behavior.");
+
+module_param(allow_prp, int, 0644);
+MODULE_PARM_DESC(allow_prp,
+    "If 1, enable legacy eMMA PrP conversion ioctl. Default 0 disables PrP "
+    "because PrP can wedge/crash when used near VPU decode; PP remains enabled.");
+
 static int __init vpu_init(void)
 {
 	int err;
@@ -1294,6 +1909,27 @@ static int __init vpu_init(void)
 		printk(KERN_ERR "vpu: ioremap failed\n");
 		return -ENOMEM;
 	}
+
+	iram.start = iram.end = 0;
+	iram_alloc_size = 0;
+	if (iram_size > 0) {
+		unsigned long addr = 0;
+
+		iram_alloc(iram_size, &addr);
+		if (!addr && iram_size <= 0xb000) {
+			addr = MX27_IRAM_BASE_ADDR;
+			printk(KERN_INFO "vpu: using fixed i.MX27 IRAM base because "
+			       "iram_alloc() is stubbed\n");
+		}
+		if (addr) {
+			iram.start = addr;
+			iram.end = addr + iram_size - 1;
+			iram_alloc_size = iram_size;
+		}
+	}
+	printk(KERN_INFO "vpu: IRAM %s start=0x%08x end=0x%08x size=0x%lx\n",
+	       iram_alloc_size ? "enabled" : "disabled",
+	       iram.start, iram.end, iram_alloc_size);
 
 	/* Map the CCM so the CLKGATE ioctl can force-ungate the VPU clock
 	 * (clk_enable() doesn't actually set PCCR1 on this R10-h28 kernel). */
@@ -1380,26 +2016,53 @@ static int __init vpu_init(void)
 				       (ahb_khz * 100u) / 133000u);
 			}
 
-			/* hclk_max=1: program AHB_PDF = 1 so HCLK = main2/2 =
-			 * ~155 MHz. The write is a single CSCR update; the new
-			 * divider takes effect on the next AHB clock. Logs the
-			 * new state so you can confirm in dmesg. */
-			if (hclk_max && ((cscr >> 8) & 0x3) != 1) {
-				u32 new_cscr = (cscr & ~(0x3u << 8)) | (0x1u << 8);
-				printk(KERN_WARNING "vpu: bumping HCLK: CSCR 0x%08x -> 0x%08x "
-				       "(AHB_PDF %u -> 1)\n",
-				       cscr, new_cscr, (cscr >> 8) & 0x3);
-				__raw_writel(new_cscr, ccm_base + 0x00);
-				/* re-read so the user can see it stuck */
-				new_cscr = __raw_readl(ccm_base + 0x00);
-				{
-					u32 main2 = (2u * plls_khz[0]) / 3u;
-					u32 new_ahb = main2 / (((new_cscr >> 8) & 0x3) + 1);
-					printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
-					       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
+			/* Program AHB_PDF directly from hclk_max so insmod with a
+			 * fresh parameter always lands on the requested rate (the
+			 * CSCR change is not auto-reverted by rmmod — only a reboot
+			 * resets it). hclk_max=1 -> AHB_PDF=1 (~155 MHz), anything
+			 * else -> AHB_PDF=2 (~103 MHz, Toon's shipped default). */
+			{
+				u32 want_pdf = hclk_max ? 1u : 2u;
+				u32 cur_pdf  = (cscr >> 8) & 0x3;
+				if (cur_pdf != want_pdf) {
+					u32 new_cscr = (cscr & ~(0x3u << 8)) | (want_pdf << 8);
+					printk(KERN_WARNING "vpu: %s HCLK: CSCR 0x%08x -> 0x%08x "
+					       "(AHB_PDF %u -> %u)\n",
+					       want_pdf == 1 ? "bumping" : "restoring",
+					       cscr, new_cscr, cur_pdf, want_pdf);
+					__raw_writel(new_cscr, ccm_base + 0x00);
+					new_cscr = __raw_readl(ccm_base + 0x00);
+					{
+						u32 main2 = (2u * plls_khz[0]) / 3u;
+						u32 new_ahb = main2 / (((new_cscr >> 8) & 0x3) + 1);
+						printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
+						       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
+					}
 				}
 			}
 		}
+	}
+
+	sdramc_base = ioremap(MX27_SDRAMC_BASE_ADDR, SZ_4K);
+	m3if_base = ioremap(MX27_M3IF_BASE_ADDR, SZ_4K);
+	max_base = NULL;
+	if (!sdramc_base)
+		printk(KERN_WARNING "vpu: SDRAMC ioremap failed; no LHD diagnostics\n");
+	if (!m3if_base)
+		printk(KERN_WARNING "vpu: M3IF ioremap failed; no M3IF diagnostics\n");
+	vpu_dump_bus_regs("before tuning");
+	if (clear_lhd && sdramc_base) {
+		u32 old = __raw_readl(sdramc_base + MX27_SDRAMC_ESDCFG0);
+		u32 new = old & ~MX27_SDRAMC_ESDCFG0_LHD;
+
+		if (old != new) {
+			printk(KERN_WARNING "vpu: clearing SDRAMC ESDCFG0.LHD: "
+			       "0x%08x -> 0x%08x\n", old, new);
+			__raw_writel(new, sdramc_base + MX27_SDRAMC_ESDCFG0);
+		} else {
+			printk(KERN_INFO "vpu: SDRAMC ESDCFG0.LHD already clear\n");
+		}
+		vpu_dump_bus_regs("after clear_lhd");
 	}
 
 	vpu_major = register_chrdev(0, "mxc_vpu", &vpu_fops);
@@ -1459,6 +2122,27 @@ static int __init vpu_init(void)
 		printk(KERN_WARNING "vpu: DMA pool empty -- module loaded too late "
 		       "in boot? VPU buffer allocation will fail.\n");
 
+	/* eMMA PP: post-decode YUV->RGB color conversion for the display path. */
+	init_waitqueue_head(&pp_queue);
+	pp_base = ioremap(MX27_EMMA_PP_BASE_ADDR, SZ_4K);
+	if (!pp_base) {
+		printk(KERN_WARNING "vpu: eMMA PP ioremap failed; no PP CSC\n");
+	} else {
+		pp_irq_num = MX27_INT_EMMAPP;
+		if (request_irq(pp_irq_num, pp_irq_handler, 0, "VPU_PP_IRQ", NULL)) {
+			printk(KERN_WARNING "vpu: eMMA PP IRQ %d request failed\n",
+			       pp_irq_num);
+			iounmap(pp_base);
+			pp_base = NULL;
+		} else {
+			emma_force_clk_on();
+			if (pp_hw_reset() == 0)
+				printk(KERN_INFO "vpu: eMMA PP ready (post-decode HW YUV->RGB)\n");
+			else
+				printk(KERN_WARNING "vpu: eMMA PP reset failed; PP may be unusable\n");
+		}
+	}
+
 	/* eMMA PrP: hardware YUV->RGB color conversion for the display path. */
 	init_waitqueue_head(&prp_queue);
 	prp_base = ioremap(MX27_EMMA_PRP_BASE_ADDR, SZ_4K);
@@ -1472,7 +2156,19 @@ static int __init vpu_init(void)
 			iounmap(prp_base);
 			prp_base = NULL;
 		} else {
-			printk(KERN_INFO "vpu: eMMA PrP ready (HW YUV->RGB)\n");
+			/* Reset PrP to clean power-on state before first use. */
+			int prp_i;
+			prp_force_clk_on();
+			PRPW(PRP_CNTL, PRP_CNTL_RST);
+			for (prp_i = 0; prp_i < 1000; prp_i++) {
+				if (PRPR(PRP_CNTL) == PRP_CNTL_RSTVAL)
+					break;
+				udelay(1);
+			}
+			if (prp_i < 1000)
+				printk(KERN_INFO "vpu: eMMA PrP ready (HW YUV->RGB)\n");
+			else
+				printk(KERN_WARNING "vpu: eMMA PrP reset timeout; PrP may be unusable\n");
 		}
 	}
 
@@ -1488,6 +2184,16 @@ err_class:
 err_chrdev:
 	unregister_chrdev(vpu_major, "mxc_vpu");
 err_iounmap:
+	if (iram_alloc_size)
+		iram_free(iram.start, iram_alloc_size);
+	if (ccm_base)
+		iounmap(ccm_base);
+	if (sdramc_base)
+		iounmap(sdramc_base);
+	if (m3if_base)
+		iounmap(m3if_base);
+	if (max_base)
+		iounmap(max_base);
 	iounmap(vpu_base);
 	return err;
 }
@@ -1495,6 +2201,10 @@ err_iounmap:
 static void __exit vpu_exit(void)
 {
 	free_irq(vpu_irq, (void *)(&vpu_data));
+	if (pp_base) {
+		free_irq(pp_irq_num, NULL);
+		iounmap(pp_base);
+	}
 	if (prp_base) {
 		free_irq(prp_irq_num, NULL);
 		iounmap(prp_base);
@@ -1506,8 +2216,16 @@ static void __exit vpu_exit(void)
 	unregister_chrdev(vpu_major, "mxc_vpu");
 	vpu_free_dma_buffer(&bitwork_mem);
 	vpu_pool_destroy();
+	if (iram_alloc_size)
+		iram_free(iram.start, iram_alloc_size);
 	if (ccm_base)
 		iounmap(ccm_base);
+	if (sdramc_base)
+		iounmap(sdramc_base);
+	if (m3if_base)
+		iounmap(m3if_base);
+	if (max_base)
+		iounmap(max_base);
 	iounmap(vpu_base);
 	vpu_major = 0;
 }

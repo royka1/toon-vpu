@@ -27,8 +27,12 @@ End-to-end pipeline:
 
 The Orange Pi handles the things the Toon can't (RTSP, H.264, scaling) and
 hands the Toon a small MPEG-4 Simple-Profile stream the i.MX27 VPU can
-decode in hardware. The Toon's eMMA PrP block does YUV→RGB565 + resize, and
-the result is blitted to `/dev/fb0`.
+decode in hardware (over TCP, or UDP/RTP). The Toon's eMMA **PP**
+(Post-Processor) does the YUV→RGB + resize/colour-correct in hardware and
+**DMAs the result straight into the framebuffer — no CPU pixel copy**. Output
+goes either to the BG plane (`/dev/fb0`, with a UI cutout) or, under freetoon,
+to the dedicated FG plane (`/dev/fb1`) that the LCDC composites over the UI in
+hardware. See [Display / rendering paths](#display--rendering-paths).
 
 ## Layout
 
@@ -41,7 +45,7 @@ the result is blitted to `/dev/fb0`.
 | `prebuilt/`   | **Ready-to-install binaries for the Toon's exact kernel** (`2.6.36-R10-h28`, ARM `armv5tejl`): `mxc_vpu.ko`, `libvpu.a`, `vpu_stream`, `vpu_dec_fb3`, and the Freescale VPU firmware (`firmware/vpu_fw_imx27_TO{1,2}.bin`), with `SHA256SUMS`. |
 | `reference/`  | Original Freescale 2.6.35 BSP eMMA PrP code we ported into the driver. |
 | `INSTALL.md`  | **Step-by-step Toon install using `prebuilt/`** — start here if you don't want to compile anything. |
-| `HANDOVER.md` | Detailed technical notes — every gotcha, every dead end, the wiring of the eMMA path, register addresses, etc. Read this before changing the driver. |
+| `HANDOFF.md`  | **Current** detailed technical notes — the PP/PrP wiring, fb0/fb1 paths, every gotcha and dead end, register addresses. Read this before changing the driver. (`HANDOVER.md` is the earlier write-up.) |
 
 > ⚠️ **The prebuilt module is kernel-version-specific.** It only loads on
 > `2.6.36-R10-h28` with `CONFIG_ARM_UNWIND=y` (`struct module` size `0x148`).
@@ -62,9 +66,20 @@ the result is blitted to `/dev/fb0`.
 - Kernel-side **register-access ioctls** (`VPU_IOC_REG_READ`/`_WRITE`) —
   userspace peripheral-bus accesses external-abort on this SoC config, so
   the library proxies every VPU register read/write through the driver.
+- Kernel-side **eMMA PP (Post-Processor) YUV→RGB + resize** ioctl
+  (`VPU_IOC_PP_CONVERT`, PP block at `0x10026000`) — the primary converter:
+  planar YUV420 → RGB565 **or** RGB888/32bpp, hardware resize (including
+  upscale, e.g. 640×360→800×450), and it can **overlap VPU decode** (convert
+  frame N while the VPU decodes N+1). Runtime-tunable hardware CSC via
+  `VPU_IOC_PP_SET_CSC`/`_GET_CSC` (luma/saturation/RGB gains read from
+  `toonui.cfg`, reloadable with `kill -HUP` — no UI restart).
 - Kernel-side **eMMA PrP YUV→RGB565 + resize** ioctl (`VPU_IOC_PRP_CONVERT`),
-  with the i.MX27 PrP block fully programmed in-driver: CSC (BT.601 studio
-  range, Q1.7 coefficients), bilinear/average scaler, IRQ-driven completion.
+  the original path, now **opt-in** via the `allow_prp=1` module param (off by
+  default): PrP can't share the AHB bus with VPU decode, so it's kept only as
+  an explicit fallback. CSC (BT.601 studio range, Q1.7 coefficients),
+  bilinear/average scaler, IRQ-driven completion.
+- Module params: `hclk_max=1` (VPU AHB clock 103→155 MHz), `allow_prp=1`
+  (enable the PrP fallback), `iram_size=` (expose i.MX27 IRAM to libvpu).
 - `vmalloc_user` + `remap_vmalloc_range` for the library's
   PROCESS-SHARED pthread mutex (avoids `VM_IO` so futex GUP works — without
   this the streamer aborts after ~minutes).
@@ -143,9 +158,29 @@ Both scripts auto-reconnect; the Toon listener stays up across reconnects.
 - Real-world max on this board: ~640×360 @ ~10 fps MPEG-4 Simple Profile.
   H.264 decode segfaults at ≥480×270 (the doorbell is High Profile, so the
   Orange Pi transcodes down to MPEG-4 for the Toon).
-- Display: 800×480 RGB565, two planes (`fb0`=BG, `fb1`=FG). The video goes
-  to `fb0` today; the Toon UI redraws over the centre, which is the next
-  thing to fix (move video to `fb1`).
+- Display: 800×480, two LCDC planes — `fb0` = BG (the UI), `fb1` = FG. The PP
+  DMAs converted pixels **straight into the chosen plane (zero-copy)**: 16bpp
+  **and** 32bpp framebuffers are both written directly (32bpp emitted natively
+  by PP; if a particular mode can't, a hardware PrP RGB565→32bpp second pass
+  covers it, with a CPU widen only as a last resort).
+- The FG plane (`fb1`) is composited over the UI **in hardware** by the LCDC —
+  no fbdev cutout, no per-frame UI repaint — but the i.MX27 FG fetch unit is
+  **16bpp-only**, so this overlay path is usable only when the UI runs 16bpp
+  (freetoon), not under the stock 32bpp qt-gui.
+
+## Display / rendering paths
+
+`vpu_stream` can put the decoded video on either LCDC plane; freetoon selects
+the mode from its video settings in `toonui.cfg`.
+
+| Mode | Plane | Flag | bpp | UI cooperation | Notes |
+|------|-------|------|-----|----------------|-------|
+| **Cutout** (BG) | `fb0` | `--rect X Y W H` | 16 **or** 32 | UI skips the rect (`fbdev_set_cutout`) | works under any UI, incl. 32bpp qt-gui; PP writes the rect directly |
+| **Overlay** (FG) | `fb1` | `--overlay` | 16 only | none — LCDC composites in HW | freetoon-only; colour-keyed full-screen window, no per-frame UI repaint |
+
+Either way the PP (or the opt-in PrP fallback) DMAs straight into the plane, so
+the steady-state CPU cost in the pixel path is ~0 (`blit 0ms` in the fps logs);
+the ~10–15 fps ceiling at 640×360 is **VPU-decode-bound, not display-bound**.
 
 ## Status
 
@@ -154,14 +189,18 @@ Both scripts auto-reconnect; the Toon listener stays up across reconnects.
 | Driver loads, ioctls work | ✅ |
 | Contiguous DMA pool | ✅ |
 | VPU MPEG-4 decode | ✅ |
-| eMMA PrP YUV→RGB565 + resize | ✅ |
-| Live RTSP doorbell pipeline | ✅ |
+| eMMA **PP** YUV→RGB + resize, overlaps decode | ✅ (primary) |
+| eMMA PrP YUV→RGB565 fallback | ✅ (opt-in, `allow_prp=1`) |
+| Runtime hardware CSC tuning (`kill -HUP`) | ✅ |
+| Zero-copy PP→framebuffer, **16bpp & 32bpp** | ✅ |
+| **FG-plane (`fb1`) hardware overlay** (freetoon, 16bpp) | ✅ |
+| Live RTSP/RTP doorbell pipeline | ✅ |
 | Stream stability (no futex abort) | ✅ |
 | Auto-reconnect on either end | ✅ |
-| Toon UI not overdrawing the video | ❌ (needs FG-plane move) |
-| Boot autostart | ❌ (init scripts not yet wired) |
+| Toon UI not overdrawing the video | ✅ (FG overlay, or BG cutout) |
+| Boot autostart | ✅ (`/etc/inittab` + `/etc/modules`; `mknod` in `ui_launcher.sh`) |
 
-See [`HANDOVER.md`](HANDOVER.md) for the full story.
+See [`HANDOFF.md`](HANDOFF.md) for the full story.
 
 ## License
 

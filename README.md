@@ -129,27 +129,82 @@ ssh root@toon "chmod +x /root/vpu/*"
 Module is `[permanent]` (it takes a self-reference via `class_create(THIS_MODULE,...)`),
 so every driver change needs a reboot.
 
-## Run
+## Streaming a camera to your Toon
 
-On the Toon:
+You transcode the camera on a "sender" box (anything with ffmpeg) into a small
+**MPEG-4 Simple-Profile** stream and send it over **RTP/UDP** to the Toon. The
+senders output **512×288**; the i.MX27 VPU decodes it and the eMMA PP
+**upscales to 800×450 at ~20 fps** on the Toon itself — keeping the encode and
+the network light.
+
+### 1. Toon-side setup (one-time)
+
+- **Firmware** — copy the Freescale VPU blobs into **`/lib/firmware/vpu/`**
+  (`vpu_fw_imx27_TO1.bin` + `vpu_fw_imx27_TO2.bin`, in [`prebuilt/firmware/`](prebuilt/firmware)).
+  The driver loads them at `vpu_Init`.
+- **Auto-load the driver EARLY at boot** — add to **`/etc/modules`**:
+  ```
+  mxc_vpu hclk_max=1 iram_size=0xb000 allow_prp=1
+  ```
+  It *must* load early: at `insmod` it reserves a 12 MB contiguous DMA pool that
+  only exists in the first ~minute after boot (later the running UI fragments
+  RAM and `IOSystemInit()` fails with "Get work buffer address failed"). Run
+  **`depmod -a`** once after installing the `.ko` so the boot-time `modprobe
+  mxc_vpu` resolves it. Confirm after a reboot: `dmesg | grep vpu` →
+  `reserved 3 x 4 MB = 12 MB total`.
+- **Device node** (no udev): `mknod /dev/mxc_vpu c <major> 0`. On freetoon this
+  is already done in `ui_launcher.sh`.
+- **Open the RTP port** `5588/udp` in the Toon's firewall. On freetoon
+  `ui_launcher.sh` already does this.
+
+### 2. Start the receiver on the Toon
 
 ```sh
-/root/vpu/doorbell.sh
+# Running freetoon (toonui) in 16bpp — use the FG overlay plane, which the LCDC
+# composites over the UI in hardware (no UI repaint, cleanest):
+vpu_stream --overlay --rect 0 15 800 450 --rtp 5588
+
+# Otherwise (no UI / quick test):
+vpu_stream --rect 0 15 800 450 --rtp 5588
+#   ^ works under the stock 32bpp qt-gui too, but qt-gui will redraw over the video
 ```
 
-On the sender (Orange Pi 5, x86 box, anything with ffmpeg):
+Under freetoon you don't normally launch this by hand — the camera tile and the
+doorbell `/show`–`/hide` endpoints warm-manage `vpu_stream` for you. The manual
+command above is for a quick test or a qt-gui Toon.
 
-```sh
-export RTSP_URL='rtsp://user:pass@CAMERA_IP:554/Streaming/Channels/101'
-export TOON_HOST='192.168.x.x'
-./scripts/orangepi-doorbell.sh
-```
+### 3. Send a camera (on any Linux machine with ffmpeg)
 
-`orangepi-doorbell.sh` is the reliable software-transcode version.
-`orangepi-doorbell-hw.sh` is a low-latency variant that pulls the camera's
-substream at its native resolution.
+All senders transcode to MPEG-4 SP 512×288 and target `rtp://<toon-ip>:5588`.
+Pick the one that matches your setup:
 
-Both scripts auto-reconnect; the Toon listener stays up across reconnects.
+| Script | For |
+|--------|-----|
+| [`scripts/doorbell_mpeg4_sw.sh`](scripts/doorbell_mpeg4_sw.sh) | A plain **RTSP** camera → Toon, **pure software** ffmpeg. Edit `URL` + `TOON` at the top, run it. Auto-reconnects. |
+| [`scripts/orangepi-ring-doorbell.py`](scripts/orangepi-ring-doorbell.py) | **Ring** doorbell/cameras via [`ring-mqtt`](https://github.com/tsightler/ring-mqtt), auto-stream on motion/ding. **Orange Pi 5** (Rockchip MPP/RGA hardware decode+scale, low CPU). |
+| [`scripts/software-ring-doorbell.py`](scripts/software-ring-doorbell.py) | Same Ring automation, **pure software** — runs on any Linux box (x86, Pi, NAS…). |
+| `scripts/orangepi-doorbell.sh` / `-hw.sh` | Generic RTSP doorbell over TCP (older variants). |
+
+The Ring scripts also call the Toon's **`/show`** and **`/hide`** HTTP endpoints
+(port 8765, served by freetoon's `doorbell_daemon`) so the video pops up automatically on an
+event and hides again after a cooldown. Edit the config block at the top of each
+script (`TOON_IP`, camera IDs, MQTT host).
+
+**Ring prerequisites** — the Ring scripts don't talk to Ring directly; they rely on
+[`ring-mqtt`](https://github.com/tsightler/ring-mqtt) (logged in to your Ring account)
+running alongside them. It provides both halves the scripts consume:
+
+- **MQTT events** — motion/ding state on `ring/+/camera/+/{motion,ding}/state`,
+  published to an MQTT broker. So you also need a broker (e.g. **mosquitto**) at
+  `MQTT_HOST:MQTT_PORT` (default `127.0.0.1:1883`).
+- **RTSP streams** — ring-mqtt's built-in **go2rtc** serves each camera at
+  `rtsp://<RING_MQTT_HOST>:<RING_MQTT_PORT>/<device_id>_live` (default port `8554`),
+  which is the input the script transcodes.
+
+Also: `pip install paho-mqtt`, and `ffmpeg` on PATH. The easiest setup is to run
+ring-mqtt + mosquitto on the same box as the script (all on `127.0.0.1`). The
+camera IDs in the config block are the ring-mqtt device IDs (the MAC-like strings
+in the MQTT topics).
 
 ## Hardware notes
 

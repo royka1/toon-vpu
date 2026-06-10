@@ -19,7 +19,7 @@ End-to-end pipeline:
 
 ```
    ┌─────────────┐  RTSP/H.264   ┌─────────────────┐  MPEG-4 / TCP   ┌──────────┐
-   │ doorbell IP │ ────────────▶ │ Orange Pi 5     │ ──────────────▶ │  Toon    │
+   │ doorbell IP │ ────────────▶ │ PC/SBC          │ ──────────────▶│  Toon    │
    │ camera      │               │ (transcode +    │                 │ (decode  │
    └─────────────┘               │  scale to 640p) │                 │  + show) │
                                  └─────────────────┘                 └──────────┘
@@ -136,10 +136,10 @@ so every driver change needs a reboot.
 
 ## Streaming a camera to your Toon
 
-You transcode the camera on a "sender" box (anything with ffmpeg) into a small
-**MPEG-4 Simple-Profile** stream and send it over **RTP/UDP** to the Toon. The
-senders output **512×288**; the i.MX27 VPU decodes it and the eMMA PP
-**upscales to 800×450 at ~20 fps** on the Toon itself — keeping the encode and
+You transcode the camera on a "sender" box (anything with ffmpeg) into a
+**MPEG-4 Simple-Profile** stream and send it over **TCP** to the Toon. The
+senders output **720×480**; the i.MX27 VPU decodes it and the eMMA PP
+**upscales to 800×480 at ~30 fps** on the Toon itself — keeping the encode and
 the network light.
 
 ### 1. Toon-side setup (one-time)
@@ -159,7 +159,7 @@ the network light.
   `reserved 3 x 4 MB = 12 MB total`.
 - **Device node** (no udev): `mknod /dev/mxc_vpu c <major> 0`. On freetoon this
   is already done in `ui_launcher.sh`.
-- **Open the RTP port** `5588/udp` in the Toon's firewall. On freetoon
+- **Open the RTP port** `5000/tcp` in the Toon's firewall. On freetoon
   `ui_launcher.sh` already does this.
 
 ### 2. Start the receiver on the Toon
@@ -167,10 +167,10 @@ the network light.
 ```sh
 # Running freetoon (toonui) in 16bpp — use the FG overlay plane, which the LCDC
 # composites over the UI in hardware (no UI repaint, cleanest):
-vpu_stream --overlay --rect 0 15 800 450 --rtp 5588
+vpu_stream --overlay 5000 --rect 0 0 800 480
 
 # Otherwise (no UI / quick test):
-vpu_stream --rect 0 15 800 450 --rtp 5588
+vpu_stream 5000 --rect 0 15 800 450
 #   ^ works under the stock 32bpp qt-gui too, but qt-gui will redraw over the video
 ```
 
@@ -215,9 +215,7 @@ in the MQTT topics).
 
 - SoC: NXP/Freescale i.MX27 (ARM926EJ-S, ARMv5).
 - VPU: Chips&Media Codadx6, MPEG-4 Simple Profile + H.264 Baseline.
-- Real-world max on this board: ~640×360 @ ~10 fps MPEG-4 Simple Profile.
-  H.264 decode segfaults at ≥480×270 (the doorbell is High Profile, so the
-  Orange Pi transcodes down to MPEG-4 for the Toon).
+- Real-world max on this board: ~720×480 @ ~30 fps MPEG-4 Simple Profile over TCP.
 - Display: 800×480, two LCDC planes — `fb0` = BG (the UI), `fb1` = FG. The PP
   DMAs converted pixels **straight into the chosen plane (zero-copy)**: 16bpp
   **and** 32bpp framebuffers are both written directly (32bpp emitted natively
@@ -240,7 +238,7 @@ the mode from its video settings in `toonui.cfg`.
 
 Either way the PP (or the opt-in PrP fallback) DMAs straight into the plane, so
 the steady-state CPU cost in the pixel path is ~0 (`blit 0ms` in the fps logs);
-the ~10–15 fps ceiling at 640×360 is **VPU-decode-bound, not display-bound**.
+the ~30 fps ceiling at 720×480 is **VPU-decode-bound, not display-bound**.
 
 ## Status
 

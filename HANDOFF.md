@@ -12,11 +12,13 @@ no udev) running a custom LVGL UI (`freetoon-lvgl`). Stream source is an
 RTSP camera reachable via an Orange Pi 5 that transcodes RTSP →
 MPEG-4 SP → TCP to the Toon.
 
-**Where we are**: ~15 fps @ 640×360 or ~11 fps @ 720×480 with eMMA PP doing
-YUV→RGB565+resize and a guarded one-frame-late PP pipeline, sub-second
-tile-open, HA-triggerable via HTTP, self-heals from wedges in ~12-24s instead
-of needing reboot. **Realistic ceiling without clock/display-path risk**:
-~15-17 fps at 640×360.
+**Where we are (2026-06-10)**: the old ~15 fps ceiling was the VPU *core*
+clock idling at 10.3 MHz (see VPUDIV gotcha below). With `vpu_div=1`
+(124 MHz core): decode-only **35–57 fps at D1** (720×480/720×576), and a real
+end-to-end **sustained 30 fps at 720×576 → 800×450** through the PP pipeline
+to fb0 (`dec` wall time input-paced; VPU busy ~7–10 ms, PP ~23 ms,
+overlapped). The decode bottleneck is gone; PP conversion is now the largest
+per-frame hardware cost.
 
 ## Hardware reality
 
@@ -37,6 +39,16 @@ Key gotchas the docs don't shout about:
   `cpu_is_mx37()`, and the non-mx5 decoder registration path writes
   `BIT_AXI_SRAM_USE=0`. Do not revert to the old "no IRAM available" theory.
 - **HCLK** defaults to 103 MHz (CSCR.AHB_PDF=2). Our kernel module accepts `mxc_vpu hclk_max=1` which bumps it to 155 MHz (CSCR.AHB_PDF=1, against mpll_main2=310 MHz). Always set in `/etc/modules`.
+- **THE VPU CORE CLOCK IS NOT HCLK** (found 2026-06-10). The i.MX27 VPU has
+  its own clock: `vpu_clk = 2*mpll_main2/(VPUDIV+4)` on TO2 silicon, VPUDIV =
+  PCDR0[15:10], source mux CSCR[21] (1=mpll_main2, 0=SPLL) — see
+  `get_rate_vpu()` in `arch/arm/mach-imx/clock-imx27.c`. The Toon bootloader
+  leaves VPUDIV=0x38 (÷60) → the Codadx6 core ran at **10.3 MHz** all along;
+  every decode benchmark before this date was clock-starved. `mxc_vpu
+  vpu_div=1` programs 124 MHz (in-spec for the 133 MHz-rated part); decode
+  went from ~3.8 to ~17+ Mpix/s. Always set in `/etc/modules`. Note mainline's
+  `clk-imx27.c` models this divider as a 3-bit `val+1` field — that's the TO1
+  layout; trust the 2.6.36 `get_rate_vpu()` rev-2 branch instead.
 - **VPU clock refcount underflow** can happen if userspace toggles `CLKGATE_SETTING` disable more than enable; produces `WARNING at __clk_disable+0x78/0x84` in dmesg. Avoid manual CLKGATE_SETTING use.
 - **`/dev/mxc_vpu` node is created by `mknod` in `/mnt/data/ui_launcher.sh`** (no udev). If missing → camera_init's poll waits forever.
 - **PrP CANNOT run concurrently with VPU decode** on the AHB bus. The PrP IRQ never fires while VPU is bursting; userspace SIGALRM doesn't help because libvpu doesn't return. This was the root cause of every PrP "pipelining" attempt deadlocking.
@@ -88,8 +100,8 @@ GitHub remotes:
   ui_launcher.sh               # respawned from inittab; mknod /dev/mxc_vpu; bpp; exec toonui
   toonui.cfg                   # camera_enabled, camera_size_pct, camera_src_w/h, camera_x/y
 /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/mxc_vpu.ko
-/etc/modules:                  # autoload at boot
-  mxc_vpu hclk_max=1
+/etc/modules:                  # autoload at boot (via /etc/modutils/vpu + update-modules)
+  mxc_vpu hclk_max=1 iram_size=0xb000 allow_prp=1 vpu_div=1
 /etc/inittab:
   toon:345:respawn:/mnt/data/ui_launcher.sh >> /var/volatile/tmp/toonui.log 2>&1
   dbel:345:respawn:/mnt/data/doorbell_daemon >> /var/volatile/tmp/doorbell.log 2>&1
@@ -318,8 +330,8 @@ Non-findings:
 |---|---|---|---|
 | `vpu_DecGetInitialInfo` hangs in libvpu after disconnect | wedged warm child, no fps progress | heartbeat watchdog → SIGKILL → kernel reset → respawn (~24 s) | still unknown; keep watchdog and collect logs if PP changes behavior |
 | AVC (H.264 baseline) decoder segfaults at ≥480x270 | not currently in use | none — MPEG-4 SP path works | debug player-side; psSaveBuffer/sliceSaveBuffer wiring may be off |
-| Decode capped around ~15 fps @ 640×360 | "spec sheet says 30 fps D1" | hclk_max=1 (155 MHz), fbcount+4, PP pipeline | clock/display path work, or lower pixel count |
-| HCLK not at chip max (155 MHz, NXP rates VPU to ~200 MHz) | conservative throughput | accepted | switch CCM AHB parent to SPLL @ ~240 MHz (risk: NAND/SDRAM stability) |
+| ~~Decode capped around ~15 fps @ 640×360~~ | **SOLVED 2026-06-10**: VPU core clock was 10.3 MHz (PCDR0 VPUDIV=0x38 bootloader default) | `vpu_div=1` → 124 MHz core; D1 decodes at 35–57 fps | done; `vpu_div=0` (155 MHz, 116% of spec) is available headroom |
+| vpu_stream can't change resolution mid-process | second session at a different size dies silently after `Video: WxH` (fb_alloced is once-per-process; `vpu_DecRegisterFrameBuffer` fails) | restart vpu_stream per resolution | re-allocate frame buffers on size change |
 
 ## Build / deploy / test
 
@@ -430,7 +442,7 @@ On-OPi script:              /home/roy/doorbell_hw.sh (roy@192.168.2.254)
 Toon IP:                    192.168.2.102
 HA HTTP endpoints:          POST :8765/show, /hide ; GET :8765/status
 Optional auth token:        /mnt/data/doorbell.token (header: X-Doorbell-Token)
-Module param:               mxc_vpu hclk_max=1 (in /etc/modules)
+Module param:               mxc_vpu vpu_div=1 hclk_max=1 iram_size=0xb000 allow_prp=1 (in /etc/modules)
 ```
 
 ## 2026-05-25 runtime note
@@ -783,6 +795,207 @@ vpu_stream --warm --rect 16 24 768 432 --rtp 5588
 
 `/mnt/data/toonui.cfg` had duplicate codec keys; the old trailing
 `camera_codec=h264` was removed and `camera_codec=mpeg4` is now the final value.
+
+## 2026-06-10 VPU core clock discovery (D1@30fps solved)
+
+Question driving the session: spec sheet says D1@30fps, best observed was
+512×288@20fps — why?
+
+Method that found it: saturated-input benchmark (`--decode-only`, test clip
+looped over TCP at full speed) showed 512×288 takes a *hardware-real* ~50 ms
+(`wait` ≈ 50 ms, one VPU IRQ per frame confirmed via `/proc/interrupts`), i.e.
+~53 AHB-cycles/pixel where Codadx6 needs ~13. The 20 fps everyone measured
+before was partly the OPi sender's `fps=20` cap; the saturated ceiling was
+~17–19 fps at 512×288.
+
+Root cause: **the VPU core clock is its own divider chain, not HCLK**.
+`vpu_clk = 2*mpll_main2/(PCDR0[15:10]+4)` (TO2). Bootloader leaves the field
+at 0x38 → ÷60 → **10.3 MHz**. All previous clock work (`hclk_max`) only
+touched the AHB *bus* clock.
+
+Fix: new `mxc_vpu` module param `vpu_div=N` programs PCDR0[15:10] (gates the
+VPU baud clock PCCR1[6] around the write). `vpu_div=1` → 124 MHz (in-spec).
+Module + `/etc/modutils/vpu` + `/etc/modules` on the Toon already updated, and
+`prebuilt/mxc_vpu.ko` + SHA256SUMS in the repo rebuilt.
+
+Measured after (124 MHz core, 155 MHz AHB, decode-only, saturated):
+
+```text
+512×288: 64–80 fps (dec ~12 ms)        was 17–19 fps (dec ~57 ms)
+720×480: 40–57 fps (dec ~17–25 ms)
+720×576: 35–47 fps (dec ~21–27 ms)
+```
+
+End-to-end with PP render to fb0 (720×576 → 800×450, ffmpeg -re pacing at
+30 fps): **sustained 29–31 fps**, `vpu 7–10ms csc ~23ms blit 0ms`, `pipe 60`.
+Framebuffer screenshot verified pixel-correct. PP conversion (~23 ms) is now
+the biggest hardware cost per frame; it still overlaps decode.
+
+Answers to standing theories:
+- "Maybe they measured interlaced + HW deinterlace": no. MPEG-4 SP is
+  progressive-only, and i.MX27 has no hardware deinterlacer (eMMA PP can't;
+  the IPU that can is MX31+). The spec number is progressive D1, and with the
+  correct core clock the silicon genuinely delivers it.
+- "Decode is pixel-count bound, not bitrate bound" (failed experiment #7):
+  still true, but the per-pixel cost was 4–5× inflated by the 10 MHz clock.
+- IRAM/SecondAXI theories: not the issue at this performance level.
+
+Notes / follow-ups:
+- `vpu_div=0` (155 MHz) was tested back-to-back against `vpu_div=1` (124 MHz)
+  on 2026-06-10: **no measurable gain** (720×480 decode-only saturated:
+  41–53 fps vs 37–54 fps; vpu busy ~16–21 ms both). Above ~124 MHz the
+  decoder is memory/AHB-bound, not core-clock-bound. Keep `vpu_div=1`
+  (in-spec); don't bother with 0.
+- The OPi sender still caps at `fps=20` + 512×288 (`scale_rkrga`); raise to
+  D1/30fps there to actually use the new headroom.
+- **Verified best 1080p→panel geometry (2026-06-10)**: crop the 16:9 source
+  to 5:3 (1800×1080), encode anamorphic **720×480@30**, display full-screen
+  with `--rect 0 0 800 480`. PP then stretches only the width (720→800 =
+  10:9) and the height is 1:1 — every panel line gets a uniquely delivered
+  line, which is the most detail the DX6 can put on this display (decoder
+  caps at 720 wide, so the horizontal 10:9 stretch is unavoidable unless you
+  letterbox 720 wide 1:1 with 40 px side bars). Measured: sustained 30.0 fps,
+  `vpu ~16ms csc ~16ms blit 0ms pipe 60`, framebuffer captures clean vs a
+  software-decode reference. Suggested OPi filter:
+  `-vf "crop=1800:1080:60:0,fps=30,scale_rkrga=w=720:h=480:format=nv12"`
+  with `-c:v mpeg4 -profile:v 0 -bf:v 0 -g:v 30 -b:v 3000k`.
+  Notes from testing: **800×480 cannot be delivered directly** (DX6 rejects
+  width >720 at sequence init: `prime failed`); the PP resize itself is free
+  (csc 15–16 ms at 1:1 vs 14–17 ms upscaling — pixel-I/O bound, not
+  ratio-bound); 16:9-without-crop alternative is 640×360 → 800×450 (5/4 both
+  axes, proven; 720×404/405 breaks either mpeg4 even-height or the PP ratio
+  table). One transient P-frame smear was captured once right after a mid-
+  stream framebuffer scp over the same WiFi — consistent with an input-feed
+  skip, self-heals at the next I-VOP; keep GOP at ~1 s.
+- vpu_stream still can't switch resolution within one process (see open
+  issues): change sender resolution → restart vpu_stream (or rely on its
+  execv self-restart paths).
+- The benchmark left the Toon with: module loaded `vpu_div=1`, UI stopped
+  (user had closed it), no vpu_stream running. `/root/vpu/mxc_vpu.ko.bak-vpudiv`
+  is the pre-change module backup.
+
+## 2026-06-10 RTP-vs-TCP: the "4 fps" was UDP loss, not the OPi and not the VPU
+
+User's `doorbell_mpeg_rtsp.sh` (rkmpp decode → vpp_rkrga crop/scale →
+`hwmap=mode=read` → mpeg4 → **RTP/UDP** 5588) showed ~4 fps on the Toon.
+Measured breakdown:
+
+- The OPi pipeline is fine: the exact filter chain + mpeg4 encode runs at
+  **28 fps (1.2× realtime)** into `-f null -`. `hwmap=mode=read` vs
+  `hwdownload` made no difference (27–28 fps both).
+- The camera relay (`rtsp://127.0.0.1:8554/front_door`, go2rtc/Frigate)
+  delivers **1080p@15fps** — `fps=30` in the filter only duplicates frames.
+  Use `fps=15` + `-g 15`.
+- Over **RTP/UDP**, the Toon logs constant `udp rtp sequence gap` (bursts of
+  17–53 packets lost; `gap_logs` caps at 12 printed lines, real count is
+  higher) and after each gap vpu_stream rightly discards until the next
+  I-VOP → **5.6–6.3 fps** displayed. `sock max 1K` during this = packets are
+  lost before the socket (USB WiFi driver RX, signal itself is fine at
+  -42 dBm). vpu_stream CPU ≈ 0%.
+- Same encode over **TCP** (`-f m4v tcp://toon:5000`): **26–29 fps
+  sustained** (= full duplicated-30 rate), `bs max <100K`, no hoarding. The
+  old "TCP hoards stale bytes" problem was a symptom of the 10 MHz decoder;
+  at 124 MHz the decoder outruns the source and the ring stays small.
+
+**Conclusion: use TCP for this link.** `~/doorbell_mpeg_tcp.sh` on the OPi
+(installed 2026-06-10) is the corrected sender: user's chain with `fps=15`,
+`-g 15`, `-f m4v tcp://$TOON:5000`. Toon side must run vpu_stream in TCP
+mode (no `--rtp`, `camera_rtp=0`).
+
+Caveats seen while testing:
+- The post-disconnect libvpu wedge (existing open issue) hit once: after a
+  TCP client disconnect the next session never started (`RN` spin in
+  DecClose/GetInitialInfo, Recv-Q backing up, sender's blocking write even
+  outlived its `timeout`). Production use should keep the toonui heartbeat
+  watchdog (SIGKILL + respawn) active; a bare manual vpu_stream has no such
+  recovery.
+- A user-built vpu_stream variant was seen logging per-RTP-packet debug
+  lines at 84% CPU; the repo binary logs at most 40 packets/session. Use the
+  repo build.
+
+## 2026-06-10 rt5370sta WiFi tuning attempts (and what's left)
+
+The Toon's WiFi is an RT5370 USB dongle (148f:5370, USB 2.0 high-speed on
+mxc-ehci.2 — NOT a 12 Mbps port) driven by the Ralink vendor STA driver
+2.5.0.3 (Prodrive build, binary-only on device at
+`/lib/modules/.../drivers/prodrive/rt5370_wlan_driver_r02/os/linux/rt5370sta.ko`,
+profile `/etc/RT2870STA.dat`, tools `/sbin/iwpriv` + `iwpriv wlan0 bainfo`).
+**Full matching source: `~/rt2800usb/` on the dev machine** (same 2.5.0.3).
+
+Link state: 65 Mbps PHY, −41 dBm, baseline TCP throughput OPi→Toon
+**10–12 Mbps** (3–4× the 3 Mbps video need). The video stalls correlate with
+RX AMPDU block-ack reorder flushes (`flush reordering_timeout_mpdus` dmesg
+spam; `bainfo` shows Recipient TID 0 BAWinSize=64).
+
+Tested (each: runtime iwpriv + forced re-join via `iwpriv wlan0 set
+SSID=H369AA873DD`; a /tmp rescue script retried the join in case SSH died):
+
+| Change | Result | Verdict |
+|---|---|---|
+| `HtBaDecline=1` (no RX AMPDU) | TCP collapsed to **24 KB/s** (!) — this AP (Experia Box) reacts catastrophically | NEVER use on this AP; reverted |
+| `HtBaWinSize=8` (small reorder window) | TCP 7–9 Mbps; video 2-min A/B: median 28.4, 15/65 windows <25 fps vs win64's 28.7 and 6/66 | worse than stock; reverted |
+| Stock (win 64) | TCP 10–12 Mbps; video median 28.7, 9% dips | **keep** |
+
+Remaining (untried, most promising): rebuild the vendor driver from
+`~/rt2800usb/` with a shorter reorder flush deadline. In
+`common/ba_action.c`: flush fires at `MAX_REORDERING_PACKET_TIMEOUT/6` =
+**500 ms** — a single lost AMPDU subframe can hold the RX queue half a
+second, which is exactly the observed feed-stall magnitude. Dropping the
+deadline to ~50 ms would convert those stalls into fast TCP retransmits.
+Needs a cross-build of the vendor tree against linux_r07 (expect GCC-14
+fights like the mxc_vpu ones).
+
+Gotchas learned: busybox `timeout` needs `-t`; iptables INPUT-vs-HCB-INPUT
+custom chain (test rules were removed after); `pkill -f` self-matches its
+own shell; a fd shared via fork (toonui ↔ vpu_stream both append to
+toonui.log through one file description) makes `/proc/pid/fdinfo` pos
+useless for attribution.
+
+Also fixed understanding: **hidden warm vpu_stream prints no fps windows by
+design** — displayable frames in hidden mode take the ClrDispFlag branch
+which increments `f_window` but never reaches the stats printf (that lives
+in the `pending_idx >= 0` block, line ~3070). Stats appear only while shown
+(POST :8765/show). Don't diagnose "no fps lines" as a wedge — check
+`/proc/interrupts` IRQ 53 rate instead. A real wedge WAS also seen: stuck
+between `Video: WxH` and `streaming...` (inside
+`vpu_DecRegisterFrameBuffer`, no SIGALRM guard there, heartbeat keeps
+ticking so the toonui watchdog never fires) after a WiFi re-join killed the
+TCP session mid-setup; `kill -9` + respawn recovered. Candidate fix: extend
+the SIGALRM guard to RegisterFrameBuffer and make the heartbeat require
+decode progress once a client is connected.
+
+## 2026-06-10 TCP glitch fix: feed_skip_to_latest no longer splices holes
+
+Root cause of "regular block glitches on TCP that UDP never showed":
+`feed_skip_to_latest()` had two paths that silently discarded bytes from a
+lossless TCP stream, splicing a mid-GOP hole → blocky corruption until the
+next I-VOP:
+
+1. When the drained backlog contained **no I-VOP** (common: a 3 Mbps `-g 30`
+   GOP is ~375K, larger than the 256K drain buffer), it dropped the drained
+   bytes entirely.
+2. The refeed after a successful I-VOP skip used a single non-wrapping
+   memcpy into the 1 MB ring — whenever the write pointer was near the ring
+   end, the tail was silently dropped.
+
+Fix (deployed + in `prebuilt/vpu_stream`): new `bs_ring_write()` helper
+commits drained chunks wrap-aware, and the no-I-VOP case now feeds the bytes
+through unchanged (latency gets trimmed at the next skip that does land on
+an I-VOP). A `skip refeed truncated` log fires if the ring-space invariant
+is ever violated (should be never; main loop keeps used < ~256K).
+Verified: 12 s link flood (forced backlog/skips) → decode continued, clean
+fb1 frame after, no truncation logs.
+
+Context for the UDP-vs-TCP question this answered: RTP mode is
+all-or-nothing per AU and needs a complete gap-free I-frame to resync, so
+fps falls exponentially with packets-per-frame — 512×288 ≈ 7 pkts/frame
+(~18 fps under loss) vs 720×480\@3 Mbps ≈ 11 pkts/frame with 35–50-packet
+I-frame bursts (~4 fps). TCP retransmits instead (26–30 fps) and, with this
+fix, no longer trades that for splice corruption.
+
+Note when reading stats: toggling show after a hidden stretch flushes the
+accumulated hidden frames into the next windows (`pp 0 csc 0` with normal
+fps) — accounting artifact, not a render failure.
 
 ## How to spend my (Claude's) remaining time
 

@@ -1946,11 +1946,46 @@ static int find_resync_start(const unsigned char *p, int total)
 	return -1;
 }
 
-static int feed_skip_to_latest(DecHandle h)
+/* Write a drained chunk into the VPU bitstream ring at the current write
+ * pointer, wrapping at the ring end. TCP delivers a lossless byte stream;
+ * dropping any part of a drained chunk splices a hole mid-GOP and corrupts
+ * every frame until the next I-VOP, so the whole chunk must be committed. */
+static int bs_ring_write(DecHandle h, const unsigned char *p, int len)
 {
 	PhysicalAddress rd, wr; Uint32 space;
+	int off, written = 0;
+
+	if (len <= 0)
+		return 0;
+	if (vpu_DecGetBitstreamBuffer(h, &rd, &wr, &space) != RETCODE_SUCCESS)
+		return -1;
+	if (len > (int)space) {
+		/* The main loop keeps the ring under ~256K used and the drain
+		 * buffer is 256K, so this cannot fire unless those invariants
+		 * change. Truncating splices a hole, so log it loudly. */
+		printf("skip refeed truncated: %d > ring space %u\n",
+		       len, (unsigned)space);
+		fflush(stdout);
+		len = (int)space;
+	}
+	off = (int)(wr - bs.phy_addr);
+	while (written < len) {
+		int chunk = STREAM_BUF_SIZE - off;
+		if (chunk > len - written)
+			chunk = len - written;
+		memcpy((void *)(bs.virt_uaddr + off), p + written, chunk);
+		written += chunk;
+		off = 0;
+	}
+	if (written > 0)
+		vpu_DecUpdateBitstreamBuffer(h, written);
+	return written;
+}
+
+static int feed_skip_to_latest(DecHandle h)
+{
 	static unsigned char tmp[DRAIN_BUF_SIZE];
-	int total, off, chunk, start_at;
+	int total, start_at;
 	int pending;
 	int used;
 
@@ -1981,30 +2016,19 @@ static int feed_skip_to_latest(DecHandle h)
 	if (total <= 0) return 0;
 
 	start_at = find_resync_start(tmp, total);
-	/* No clean random-access point visible: drop the drained socket bytes.
-	 * The decoder can keep consuming whatever is already in its bitstream
-	 * ring; feeding more dependent frames is exactly how latency grows
-	 * without bound. */
+	/* No random-access point visible in the drained window (a D1-bitrate
+	 * GOP can exceed the 256K drain buffer). Feed the bytes through
+	 * unchanged: dropping them would splice a mid-GOP hole into a lossless
+	 * TCP stream and show blocky corruption until the next I-VOP. Latency
+	 * gets trimmed at the next skip that does land on an I-VOP. */
 	if (start_at < 0)
-		return 0;
+		return bs_ring_write(h, tmp, total);
 
 	/* We found a clean random-access point in the socket backlog. Flush stale
 	 * compressed bytes that were already hoarded in the VPU ring, then feed
 	 * only from that point onward. */
 	vpu_DecBitBufferFlush(h);
-
-	if (vpu_DecGetBitstreamBuffer(h, &rd, &wr, &space) != RETCODE_SUCCESS)
-		return -1;
-
-	off = (int)(wr - bs.phy_addr);
-	chunk = STREAM_BUF_SIZE - off;
-	if (chunk > total - start_at) chunk = total - start_at;
-	if (chunk > (int)space) chunk = (int)space;
-	if (chunk <= 0) return 0;
-
-	memcpy((void *)(bs.virt_uaddr + off), tmp + start_at, chunk);
-	vpu_DecUpdateBitstreamBuffer(h, chunk);
-	return chunk;
+	return bs_ring_write(h, tmp + start_at, total - start_at);
 }
 
 #define CFG_PATH "/mnt/data/toonui.cfg"

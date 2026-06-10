@@ -78,8 +78,13 @@ hardware. See [Display / rendering paths](#display--rendering-paths).
   default): PrP can't share the AHB bus with VPU decode, so it's kept only as
   an explicit fallback. CSC (BT.601 studio range, Q1.7 coefficients),
   bilinear/average scaler, IRQ-driven completion.
-- Module params: `hclk_max=1` (VPU AHB clock 103→155 MHz), `allow_prp=1`
-  (enable the PrP fallback), `iram_size=` (expose i.MX27 IRAM to libvpu).
+- Module params: `vpu_div=1` (**the big one** — programs the VPU *core* clock
+  divider PCDR0[15:10]; the Toon bootloader leaves it at ÷60 so the Codadx6
+  core idles at **10.3 MHz**, and `vpu_div=1` raises it to **124 MHz** =
+  2×mpll_main2/(1+4), a 4–5× decode speedup that makes real D1@30fps decode
+  possible; `vpu_div=0` would give 155 MHz, above the 133 MHz spec),
+  `hclk_max=1` (VPU AHB bus clock 103→155 MHz), `allow_prp=1` (enable the PrP
+  fallback), `iram_size=` (expose i.MX27 IRAM to libvpu).
 - `vmalloc_user` + `remap_vmalloc_range` for the library's
   PROCESS-SHARED pthread mutex (avoids `VM_IO` so futex GUP works — without
   this the streamer aborts after ~minutes).
@@ -144,7 +149,7 @@ the network light.
   The driver loads them at `vpu_Init`.
 - **Auto-load the driver EARLY at boot** — add to **`/etc/modules`**:
   ```
-  mxc_vpu hclk_max=1 iram_size=0xb000 allow_prp=1
+  mxc_vpu vpu_div=1 hclk_max=1 iram_size=0xb000 allow_prp=1
   ```
   It *must* load early: at `insmod` it reserves a 12 MB contiguous DMA pool that
   only exists in the first ~minute after boot (later the running UI fragments

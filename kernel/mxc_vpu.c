@@ -1878,6 +1878,20 @@ MODULE_PARM_DESC(hclk_max,
     "If 1, bump HCLK/VPU from ~103 MHz to ~155 MHz at module load "
     "(CSCR.AHB_PDF 2->1). Slightly above i.MX27 spec; revert via reboot.");
 
+/* The i.MX27 VPU core does NOT run on HCLK: it has its own clock path,
+ * vpu_clk = 2 * mpll_main2 / (VPUDIV + 4) on TO2 silicon, with VPUDIV in
+ * PCDR0 bits [15:10] (see get_rate_vpu() in arch/arm/mach-imx/clock-imx27.c;
+ * source mux mpll_main2/SPLL is CSCR bit 21). The Toon bootloader leaves
+ * VPUDIV at 0x38 (= divide by 60) -> the VPU core idles along at ~10 MHz,
+ * which is why decode was ~4x slower than the spec sheet. VPUDIV=0 gives
+ * 2*310/4 = 155 MHz; VPUDIV=1 gives 124 MHz (the in-spec choice for a
+ * 133 MHz-rated part). -1 leaves the bootloader value untouched. */
+static int vpu_div = -1;
+module_param(vpu_div, int, 0644);
+MODULE_PARM_DESC(vpu_div,
+    "i.MX27 TO2 VPU core clock divider field PCDR0[15:10]; "
+    "vpu_clk = 2*mpll_main2/(vpu_div+4); -1 = don't touch (bootloader default)");
+
 static int clear_lhd = 0;
 module_param(clear_lhd, int, 0644);
 MODULE_PARM_DESC(clear_lhd,
@@ -2038,6 +2052,41 @@ static int __init vpu_init(void)
 						printk(KERN_WARNING "vpu: HCLK/VPU now %u kHz "
 						       "(CSCR=0x%08x)\n", new_ahb, new_cscr);
 					}
+				}
+			}
+
+			/* VPU core clock (separate from HCLK!). TO2 silicon:
+			 *   vpu_clk = 2 * parent / (PCDR0[15:10] + 4)
+			 * parent = CSCR[21] ? mpll_main2 : SPLL. */
+			{
+				u32 main2 = (2u * plls_khz[0]) / 3u;
+				u32 vsrc = (cscr >> 21) & 1;
+				u32 vparent = vsrc ? main2 : plls_khz[1];
+				u32 cur_pdf = (pcdr0 >> 10) & 0x3f;
+				printk(KERN_INFO "vpu: VPU core clk = %u kHz "
+				       "(src=%s VPUDIV=%u)\n",
+				       2u * vparent / (cur_pdf + 4u),
+				       vsrc ? "mpll_main2" : "spll", cur_pdf);
+				if (vpu_div >= 0 && (u32)vpu_div != cur_pdf) {
+					u32 want = (u32)vpu_div & 0x3f;
+					u32 pccr1 = __raw_readl(ccm_base + 0x24);
+					u32 new_pcdr0;
+					/* gate the VPU baud clock (PCCR1 bit 6)
+					 * around the divider change */
+					__raw_writel(pccr1 & ~(1u << 6),
+						     ccm_base + 0x24);
+					new_pcdr0 = (pcdr0 & ~(0x3fu << 10)) |
+						    (want << 10);
+					__raw_writel(new_pcdr0, ccm_base + 0x18);
+					__raw_writel(pccr1 | (1u << 6),
+						     ccm_base + 0x24);
+					new_pcdr0 = __raw_readl(ccm_base + 0x18);
+					printk(KERN_WARNING "vpu: VPU core clk "
+					       "%u -> %u kHz (PCDR0 0x%08x -> "
+					       "0x%08x, VPUDIV %u -> %u)\n",
+					       2u * vparent / (cur_pdf + 4u),
+					       2u * vparent / (want + 4u),
+					       pcdr0, new_pcdr0, cur_pdf, want);
 				}
 			}
 		}

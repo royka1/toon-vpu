@@ -143,10 +143,18 @@ ssh root@<toon> '
     /sbin/depmod -a
     # if it is not already loaded:
     grep -q mxc_vpu /proc/modules || /sbin/insmod \
-        /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/mxc_vpu.ko
+        /lib/modules/2.6.36-R10-h28/kernel/drivers/mxc/vpu/mxc_vpu.ko \
+        vpu_div=1 hclk_max=1 iram_size=0xb000
     dmesg | tail -15
 '
 ```
+
+> ⚠️ **Always pass `vpu_div=1`.** The Toon bootloader leaves the VPU *core*
+> clock divider (PCDR0[15:10]) at ÷60, i.e. the Codadx6 runs at **10.3 MHz**
+> instead of its rated ~133 MHz, and decode is 4–5× slower than it should be
+> (D1 tops out around 11 fps instead of 35+). `vpu_div=1` sets the core clock
+> to 124 MHz. `hclk_max=1` additionally raises the VPU's AHB bus clock
+> 103→155 MHz.
 
 In `dmesg` you should see lines like:
 

@@ -13,13 +13,13 @@ while true; do
     -timeout 5000000 \
     -i "$URL" \
     -an \
-    -vf "fps=20,vpp_rkrga=cx=0:cy=0:cw=1440:ch=810:w=512:h=288:format=nv12:async_depth=4,hwmap=mode=read,format=nv12,format=yuv420p" \
+    -vf "fps=30,vpp_rkrga=cx=60:cy=0:cw=1350:ch=810:w=720:h=480:format=nv12:async_depth=4,hwmap=mode=read,format=nv12,format=yuv420p" \
     -c:v mpeg4 -profile:v 0 \
-    -bf:v 0 -g:v 20 \
-    -b:v 1200k -maxrate 1500k -bufsize 300k \
+    -bf:v 0 -g:v 15 \
+    -b:v 2000k -maxrate 2400k -bufsize 600k \
     -flush_packets 1 \
     -max_delay 0 \
     -avioflags direct \
-    -f rtp "rtp://$TOON:5588?pkt_size=1200"
+    -f m4v "tcp://$TOON:5000"
   echo "stream dropped; reconnecting in 2s..."; sleep 2
 done

@@ -12,7 +12,7 @@ while true; do
     -vf "fps=30,crop=1350:810:60:0,scale=720:480:flags=fast_bilinear,format=yuv420p" \
     -c:v mpeg4 -profile:v 0 \
     -bf:v 0 -g:v 30 \
-    -b:v 2000k -maxrate 2400k -bufsize 600k \
+    -b:v 3000k -maxrate 3000k -bufsize 1000k \
     -flush_packets 1 \
     -max_delay 0 \
     -avioflags direct \

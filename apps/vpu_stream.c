@@ -1855,6 +1855,15 @@ static int feed(DecHandle h, int block)
 	chunk = STREAM_BUF_SIZE - off;
 	if (chunk > (int)space) chunk = space;
 	if (chunk > FEED_CHUNK_SIZE) chunk = FEED_CHUNK_SIZE;
+	if (block) {
+		/* Never block forever: a source that stops sending but leaves the
+		 * TCP connection open would otherwise wedge here, so the decode
+		 * loop never reaches the stall watchdog or the hide handling and
+		 * the last frame freezes on screen (only a kill -9 cleared it).
+		 * Wake every 300 ms so the loop can react. */
+		struct pollfd pfd = { sock, POLLIN, 0 };
+		if (poll(&pfd, 1, 300) <= 0) return -1;   /* timeout/err: no data now */
+	}
 	fcntl(sock, F_SETFL, block ? 0 : O_NONBLOCK);
 	n = recv(sock, (void *)(bs.virt_uaddr + off), chunk, 0);
 	if (n > 0) { vpu_DecUpdateBitstreamBuffer(h, n); return n; }
@@ -3181,6 +3190,11 @@ int main(int argc, char **argv)
 				int fb = feed(h, 1);
 				if (fb == 0) break;
 				if (fb > 0) last_data_ms = now_ms();
+				/* No data right now: make a pending hide take effect even
+				 * while the source is stalled, so the frozen last frame is
+				 * cleared instead of lingering until a kill -9. The stall
+				 * watchdog above then reconnects once it times out. */
+				else if (g_overlay && !g_show && ov_gw_on) gw_set(0);
 			}
 			if (g_show && !g_armed) {
 				long now = now_ms();

@@ -1860,9 +1860,11 @@ static int feed(DecHandle h, int block)
 		 * TCP connection open would otherwise wedge here, so the decode
 		 * loop never reaches the stall watchdog or the hide handling and
 		 * the last frame freezes on screen (only a kill -9 cleared it).
-		 * Wake every 300 ms so the loop can react. */
+		 * Wake every 300 ms so the loop can react. Return -2 (distinct from
+		 * a hard error/EOF) so callers can tell "no data yet" from "stream
+		 * gone" -- the prime phase must keep waiting on -2, not give up. */
 		struct pollfd pfd = { sock, POLLIN, 0 };
-		if (poll(&pfd, 1, 300) <= 0) return -1;   /* timeout/err: no data now */
+		if (poll(&pfd, 1, 300) <= 0) return -2;   /* timeout: no data yet */
 	}
 	fcntl(sock, F_SETFL, block ? 0 : O_NONBLOCK);
 	n = recv(sock, (void *)(bs.virt_uaddr + off), chunk, 0);
@@ -2648,10 +2650,13 @@ int main(int argc, char **argv)
 		}
 		if (vpu_DecOpen(&h, &op) != RETCODE_SUCCESS) { close(sock); continue; }
 
-		/* Prime: feed until the sequence header parses.
-		 * Two safety nets against a hung vpu_DecGetInitialInfo:
-		 *   1. Try-count cap (64): only counts our loop iterations.
-		 *   2. SO_RCVTIMEO=5s on sock: recv times out -> feed=-1 -> break. */
+		/* Prime: feed until the sequence header parses. Bounded by a try
+		 * cap (64 iters; the 300 ms feed() poll means a silent source can't
+		 * spin faster than that, so this is also a ~19 s wall-clock ceiling).
+		 * A no-data tick (feed == -2) does NOT abort -- a slow encoder may
+		 * take a moment to send its first frame after connecting, and giving
+		 * up there would close the socket under it (ffmpeg "Broken pipe").
+		 * Only a real EOF/error closes + reconnects. */
 		int prime_tries = 0;
 		while (!inited && prime_tries++ < (rtp_listen_port ? 512 : 64)) {
 			if (rtp_listen_port) {
@@ -2661,8 +2666,12 @@ int main(int argc, char **argv)
 					break;
 				if (fr < 0)
 					continue;
-			} else if (feed(h, 1) <= 0) {
-				break;            /* EOF/err/timeout */
+			} else {
+				int fr = feed(h, 1);
+				if (fr == 0 || fr == -1) break;  /* EOF / hard error -> reconnect */
+				if (fr == -2) continue;          /* no data yet (slow stream
+				                                  * start): keep waiting, don't
+				                                  * close the connection */
 			}
 			vpu_DecSetEscSeqInit(h, 1);
 			if (dec_get_initial_info_guarded(h, &ii) == RETCODE_SUCCESS) inited = 1;

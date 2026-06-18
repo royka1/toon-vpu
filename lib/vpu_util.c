@@ -984,11 +984,22 @@ semaphore_t *vpu_semaphore_open(void)
 		err_msg("Unable to map physical of share memory\n");
 		return NULL;
 	}
+	/* (Re)initialise the locks for THIS process every time.
+	 *
+	 * These mutexes live in vmalloc-backed kernel share_mem mapped to user
+	 * space. A PROCESS_SHARED futex on that mapping can make sys_futex spin
+	 * UNKILLABLY in the kernel (get_futex_key over the vmalloc page) on this
+	 * 2.6.36 kernel -- observed as a 100%-sys, kill-9-proof hang after a
+	 * stream stop. The Toon runs a single vpu_stream, so only intra-process
+	 * (thread) serialisation is needed: use a PRIVATE futex, which keys on
+	 * VA+mm and never walks the page. Because share_mem is now persistent
+	 * (the kernel no longer vfree()s it on last close), re-init the lock state
+	 * per process so a predecessor that died holding it can't leave it stuck. */
+	pthread_mutexattr_init(&psharedm);
+	pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_PRIVATE);
+	pthread_mutex_init(&semap->api_lock, &psharedm);
+	pthread_mutex_init(&semap->reg_lock, &psharedm);
 	if (!semap->is_initialized) {
-		pthread_mutexattr_init(&psharedm);
-		pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_SHARED);
-		pthread_mutex_init(&semap->api_lock, &psharedm);
-		pthread_mutex_init(&semap->reg_lock, &psharedm);
 		for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
 			pCodecInst = (CodecInst *) (&semap->codecInstPool[i]);
 			pCodecInst->instIndex = i;
@@ -1025,20 +1036,25 @@ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
 #else
 	struct timespec ts;
 	int ret = 0;
+	pthread_mutex_t *m;
+
+	if (mutex == API_MUTEX)
+		m = &semap->api_lock;
+	else if (mutex == REG_MUTEX)
+		m = &semap->reg_lock;
+	else {
+		warn_msg("Not supported mutex\n");
+		return false;
+	}
 
 	ts.tv_sec = time(NULL) + mutex_timeout;
 	ts.tv_nsec = 0;
-	if (mutex == API_MUTEX)
-		ret = pthread_mutex_timedlock(&semap->api_lock, &ts);
-	else if (mutex == REG_MUTEX)
-		ret = pthread_mutex_timedlock(&semap->reg_lock, &ts);
-	else
-		warn_msg("Not supported mutex\n");
+	ret = pthread_mutex_timedlock(m, &ts);
 	if (ret == ETIMEDOUT) {
 		warn_msg("VPU mutex couldn't be locked before timeout expired\n");
 		return false;
 	}
-	return true;
+	return ret == 0;
 #endif
 }
 

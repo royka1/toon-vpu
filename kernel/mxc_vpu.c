@@ -1573,13 +1573,14 @@ static int vpu_release(struct inode *inode, struct file *filp)
 		}
 		vpu_free_buffers();
 
-		/* Free shared memory when vpu device is idle (share_mem is now
-		 * vmalloc'd host-side semaphore memory, so vfree it). */
-		vfree((void *)share_mem.cpu_addr);
-		share_mem.cpu_addr = 0;
-		share_mem.phy_addr = 0;
-		vfree((void *)vshare_mem.cpu_addr);
-		vshare_mem.cpu_addr = 0;
+		/* Do NOT free share_mem/vshare_mem here. They hold libvpu's
+		 * host-side semaphore -- a futex mapped into user space via
+		 * remap_vmalloc_range. Freeing the vmalloc pages on last close while
+		 * a userspace mapping can still reference them is a use-after-free;
+		 * combined with a futex living on that vmalloc mapping it wedged
+		 * sys_futex in an unkillable 100%-sys spin after a stream stop. They
+		 * are tiny and already reused across opens (GET_SHARE_MEM keeps them
+		 * when cpu_addr != 0); they are released in vpu_exit() at unload. */
 	}
 	spin_unlock(&vpu_lock);
 
@@ -2265,6 +2266,13 @@ static void __exit vpu_exit(void)
 	unregister_chrdev(vpu_major, "mxc_vpu");
 	vpu_free_dma_buffer(&bitwork_mem);
 	vpu_pool_destroy();
+	/* share_mem/vshare_mem are now persistent across opens (see vpu_release);
+	 * release them here at module unload. vfree(NULL) is a no-op. */
+	vfree((void *)share_mem.cpu_addr);
+	share_mem.cpu_addr = 0;
+	share_mem.phy_addr = 0;
+	vfree((void *)vshare_mem.cpu_addr);
+	vshare_mem.cpu_addr = 0;
 	if (iram_alloc_size)
 		iram_free(iram.start, iram_alloc_size);
 	if (ccm_base)

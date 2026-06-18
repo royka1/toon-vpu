@@ -26,6 +26,7 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include "vpu_reg.h"
 #include "vpu_lib.h"
@@ -40,6 +41,39 @@
 #define IMAGE_ENDIAN			0
 #define STREAM_ENDIAN			0
 #endif
+
+/* Bounded replacement for the raw `while (VpuReadReg(BIT_BUSY_FLAG));` spins.
+ * The CODA BIT processor clears BIT_BUSY_FLAG when a command completes. If the
+ * core is left mid-command -- e.g. a decode/flush issued while a previous
+ * PIC_RUN never finished because the source stopped mid-frame -- the flag never
+ * clears, and the old tight loop pegged a CPU at 100% with no escape (the
+ * "stops streaming -> vpu_stream becomes a CPU hog" wedge). Mirror what the
+ * kernel driver already does for its own busy-wait (mxc_vpu.c: msleep(1) + ~1s
+ * timeout): yield between polls so a wedge can never hog the CPU, and bail after
+ * a timeout so the caller always returns and the app's reconnect path can run. */
+#define VPU_BUSY_TIMEOUT_MS	1000
+
+static void WaitBitBusyClear(void)
+{
+	struct timeval t0, now;
+
+	/* Fast path: command already done (or never started). */
+	if (!VpuReadReg(BIT_BUSY_FLAG))
+		return;
+
+	/* Bound by real wall-clock time, not an iteration count: usleep()
+	 * granularity on this kernel can round a sub-tick sleep up to a full
+	 * tick, which would otherwise stretch the timeout unpredictably. The
+	 * sleep only has to yield the CPU -- the clock decides when we give up. */
+	gettimeofday(&t0, NULL);
+	do {
+		usleep(500);
+		if (!VpuReadReg(BIT_BUSY_FLAG))
+			return;
+		gettimeofday(&now, NULL);
+	} while ((now.tv_sec - t0.tv_sec) * 1000L +
+		 (now.tv_usec - t0.tv_usec) / 1000L < VPU_BUSY_TIMEOUT_MS);
+}
 
 static PhysicalAddress rdPtrRegAddr[] = {
 	BIT_RD_PTR_0,
@@ -202,7 +236,7 @@ RetCode vpu_Init(void *cb)
 
 		VpuWriteReg(BIT_BUSY_FLAG, 1);
 		VpuWriteReg(BIT_CODE_RUN, 1);
-		while (VpuReadReg(BIT_BUSY_FLAG));
+		WaitBitBusyClear();
 
 		IOClkGateSet(false);
 
@@ -347,7 +381,7 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo)
 
 	BitIssueCommand(0, 0, FIRMWARE_GET);
 
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 
 	ver = VpuReadReg(RET_VER_NUM);
 	UnlockVpu(vpu_semap);
@@ -542,7 +576,7 @@ RetCode vpu_EncClose(EncHandle handle)
 	if (pEncInfo->initialInfoObtained) {
 		BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
 				SEQ_END);
-		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+		WaitBitBusyClear();
 	}
 
 	/* Free memory allocated for data report functions */
@@ -761,7 +795,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
 	VpuWriteReg(CMD_ENC_SEARCH_SIZE, pEncInfo->secAxiUse.searchRamSize);
 
 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, SEQ_INIT);
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 
 	if (VpuReadReg(RET_ENC_SEQ_SUCCESS) == 0) {
 		UnlockVpu(vpu_semap);
@@ -887,7 +921,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
 			SET_FRAME_BUF);
 
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 	UnlockVpu(vpu_semap);
 
 	return RETCODE_SUCCESS;
@@ -1955,7 +1989,17 @@ RetCode vpu_DecClose(DecHandle handle)
 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
 
 	if (*ppendingInst == pCodecInst) {
-		return RETCODE_FRAME_NOT_COMPLETE;
+		/* A vpu_DecStartOneFrame() on this instance was never completed with
+		 * vpu_DecGetOutputInfo() -- the caller abandoned the decode (e.g. the
+		 * TCP stream ended mid-frame, so vpu_stream's decode loop bailed
+		 * before reading the result). That start path still holds vpu_semap
+		 * and leaves *ppendingInst set. The old early-return here leaked the
+		 * lock forever, so the *next* session's vpu_DecOpen() timed out taking
+		 * it ("VPU mutex couldn't be locked before timeout expired") and the
+		 * new client got its connection reset. Drop the abandoned lock and
+		 * clear the pending op, then close normally. */
+		*ppendingInst = 0;
+		UnlockVpu(vpu_semap);
 	}
 
 	if (!LockVpu(vpu_semap))
@@ -1970,7 +2014,7 @@ RetCode vpu_DecClose(DecHandle handle)
 		}
 		BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
 				SEQ_END);
-		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+		WaitBitBusyClear();
 	}
 
 	/* Free memory allocated for data report functions */
@@ -2137,7 +2181,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
 	}
 
 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, SEQ_INIT);
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 
 	if (VpuReadReg(RET_DEC_SEQ_SUCCESS) == 0) {
 		val = VpuReadReg(RET_DEC_SEQ_ERR_REASON);
@@ -2404,7 +2448,9 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
 	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
 
-	if (cpu_is_mx37() && pDecInfo->openParam.bitstreamFormat != STD_VC1)
+	if ((cpu_is_mx37() ||
+	     (cpu_is_mx27() && vpu_dec_iram_enabled())) &&
+	    pDecInfo->openParam.bitstreamFormat != STD_VC1)
 		vpu_setting_iram();
 	else if (cpu_is_mx5x()) {
 		VpuWriteReg(CMD_SET_FRAME_AXI_BIT_ADDR, pDecInfo->secAxiUse.bufBitUse);
@@ -2437,7 +2483,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
 			SET_FRAME_BUF);
 
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 	UnlockVpu(vpu_semap);
 
 	return RETCODE_SUCCESS;
@@ -3251,7 +3297,7 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
 			DEC_BUF_FLUSH);
 
-	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+	WaitBitBusyClear();
 
 	pDecInfo->streamWrPtr = pDecInfo->streamBufStartAddr;
 	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, pDecInfo->streamBufStartAddr);

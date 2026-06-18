@@ -44,6 +44,48 @@ static long now_ms(void)
 	return tv.tv_sec * 1000L + tv.tv_usec / 1000L;
 }
 
+/* --- progress watchdog ----------------------------------------------------
+ * The decode path calls into libvpu, which takes a PROCESS-SHARED mutex living
+ * in the kernel's VPU share_mem (semaphore_wait -> pthread_mutex_timedlock).
+ * If a prior warm-mode instance died holding that lock, or the shared page was
+ * recycled across overlapping opens, timedlock can livelock in the futex
+ * (EAGAIN spin) and pin a CPU at 100% forever -- and it sits *below* the decode
+ * loop's own watchdogs, so none of them ever run again (observed: stuck in
+ * __futex_abstimed_wait_common, all time in sys, zero voluntary ctxt switches).
+ * A separate thread tracks main-loop progress and hard-exits if it stalls.
+ * The process exit closes /dev/mxc_vpu (we are its sole opener), which triggers
+ * the kernel last-close hard reset and frees share_mem, so the respawn that
+ * toonui starts comes up on a clean VPU with a freshly initialised lock. */
+#define WATCHDOG_STALL_MS 10000
+static volatile long g_hb_ms;             /* last main-loop progress (ms)     */
+static volatile sig_atomic_t g_hb_active; /* 1 while a session is live, else 0 */
+static pid_t g_main_pid;                  /* tgid, captured in main()         */
+
+static void hb(void) { g_hb_ms = now_ms(); }
+
+static void *watchdog_main(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		usleep(1000 * 1000);
+		if (g_hb_active && now_ms() - g_hb_ms > WATCHDOG_STALL_MS) {
+			static const char m[] =
+			    "vpu_stream: progress watchdog: stalled >10s "
+			    "(libvpu lock wedge?); restarting for clean VPU\n";
+			write(STDERR_FILENO, m, sizeof(m) - 1);
+			/* SIGKILL the whole process group, NOT _exit(): the static
+			 * libc wires _exit() to __NR_exit, which under NPTL kills only
+			 * this watchdog thread and leaves the wedged main thread
+			 * spinning. kill(SIGKILL) is kernel-enforced and whole-process;
+			 * the resulting fd close on /dev/mxc_vpu still triggers the
+			 * kernel last-close reset, so the respawn comes up clean. */
+			kill(g_main_pid, SIGKILL);
+			_exit(124);   /* unreachable fallback */
+		}
+	}
+	return NULL;
+}
+
 #define STREAM_BUF_SIZE   (1 * 1024 * 1024)
 #define DRAIN_BUF_SIZE    (256 * 1024)
 #define FEED_CHUNK_SIZE   (32 * 1024)
@@ -2286,6 +2328,16 @@ int main(int argc, char **argv)
 	signal(SIGHUP, on_sighup);
 	signal(SIGALRM, on_sigalrm);
 
+	/* Progress watchdog: escapes a libvpu lock/ioctl wedge that would
+	 * otherwise pin a CPU forever (see watchdog_main). Idle until a session
+	 * goes live (g_hb_active), so warm-mode waiting in accept() is fine. */
+	g_main_pid = getpid();
+	{
+		pthread_t wd_tid;
+		if (pthread_create(&wd_tid, NULL, watchdog_main, NULL) == 0)
+			pthread_detach(wd_tid);
+	}
+
 	int port = 5000;
 	int codec_from_arg = 0;
 	char *rtsp_source_url = NULL;
@@ -2503,6 +2555,11 @@ int main(int argc, char **argv)
 	}
 	}
 
+	/* vpu_Init() takes the shared VPU lock; if a respawn inherited a wedged
+	 * lock it can livelock here at startup (g_hb_active is still 0). Arm the
+	 * watchdog across it -- the outer loop drops g_hb_active before accept(). */
+	hb();
+	g_hb_active = 1;
 	if (vpu_Init(NULL) != RETCODE_SUCCESS) { fprintf(stderr, "vpu_Init fail\n"); return 1; }
 	bs.size = STREAM_BUF_SIZE;
 	if (IOGetPhyMem(&bs) || IOGetVirtMem(&bs) <= 0) { fprintf(stderr, "bs alloc\n"); return 1; }
@@ -2539,6 +2596,9 @@ int main(int argc, char **argv)
 
 		memset(&rtp_direct_state, 0, sizeof(rtp_direct_state));
 		last_data_ms = now_ms();
+		g_hb_active = 0;   /* idle until a session is live: a long wait in
+				    * accept()/for-first-packet must not trip the
+				    * progress watchdog */
 
 		if (rtsp_source_url) {
 			int sv[2];
@@ -2632,6 +2692,12 @@ int main(int argc, char **argv)
 			printf("client connected\n");
 		fflush(stdout);
 
+		/* Session is live: arm the progress watchdog. From here every
+		 * libvpu call (DecOpen, prime, decode) can hit the shared lock,
+		 * so keep the heartbeat fresh through prime and the decode loop. */
+		hb();
+		g_hb_active = 1;
+
 		memset(&op, 0, sizeof(op));
 		op.bitstreamFormat = g_codec;
 		if (g_pp_deblock)
@@ -2659,6 +2725,7 @@ int main(int argc, char **argv)
 		 * Only a real EOF/error closes + reconnects. */
 		int prime_tries = 0;
 		while (!inited && prime_tries++ < (rtp_listen_port ? 512 : 64)) {
+			hb();
 			if (rtp_listen_port) {
 				int fr = rtp_feed_direct(h, &rtp_direct_state,
 							 rtp_spspps, rtp_spspps_len, 1);
@@ -2919,6 +2986,8 @@ int main(int argc, char **argv)
 		for (;;) {
 			DecParam dp; DecOutputInfo oi;
 			int rendered_pending = 0;
+			hb();   /* progress heartbeat: a wedge inside any libvpu
+				 * call below stops this from updating -> watchdog */
 			/* When falling behind (socket buffer > 32KB), discard stale
 			 * data and re-sync at the most recent key frame so the delay
 			 * doesn't grow unbounded. */

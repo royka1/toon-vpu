@@ -2723,7 +2723,12 @@ int main(int argc, char **argv)
 			op.psSaveBuffer = ps.phy_addr;
 			op.psSaveBufferSize = ps.size;
 		}
-		if (vpu_DecOpen(&h, &op) != RETCODE_SUCCESS) { close(sock); continue; }
+		if (vpu_DecOpen(&h, &op) != RETCODE_SUCCESS) {
+			printf("vpu_DecOpen failed; dropping client\n");
+			fflush(stdout);
+			close(sock);
+			continue;
+		}
 
 		/* Prime: feed until the sequence header parses. Bounded by a try
 		 * cap (64 iters; the 300 ms feed() poll means a silent source can't

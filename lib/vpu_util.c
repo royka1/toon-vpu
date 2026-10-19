@@ -999,14 +999,17 @@ semaphore_t *vpu_semaphore_open(void)
 	pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_PRIVATE);
 	pthread_mutex_init(&semap->api_lock, &psharedm);
 	pthread_mutex_init(&semap->reg_lock, &psharedm);
-	if (!semap->is_initialized) {
-		for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
-			pCodecInst = (CodecInst *) (&semap->codecInstPool[i]);
-			pCodecInst->instIndex = i;
-			pCodecInst->inUse = 0;
-		}
-		semap->is_initialized = 1;
+	/* Same for the codec-instance pool: a predecessor killed mid-session
+	 * (crash, SIGKILL, vpu_stream's own stall watchdog) never ran
+	 * vpu_DecClose, so its slot stayed inUse in the persistent share_mem.
+	 * After MAX_NUM_INSTANCE such deaths every vpu_DecOpen failed until
+	 * reboot. With a single VPU process, a new one owns the whole pool. */
+	for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
+		pCodecInst = (CodecInst *) (&semap->codecInstPool[i]);
+		pCodecInst->instIndex = i;
+		pCodecInst->inUse = 0;
 	}
+	semap->is_initialized = 1;
 
 	timeout_env = getenv("VPU_MUTEX_TIMEOUT");
 	if (timeout_env == NULL)

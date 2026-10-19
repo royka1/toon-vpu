@@ -92,6 +92,9 @@ static void *watchdog_main(void *arg)
 #define BS_LOW_WATER      (128 * 1024)
 #define NO_FRAME_TIMEOUT_MS 8000
 #define KEYFRAME_TIMEOUT_MS 15000
+/* Shown + armed but no frame successfully rendered for this long: reconnect
+ * (resets the PP state) instead of leaving a frozen frame on the overlay. */
+#define RENDER_FAIL_TIMEOUT_MS 3000
 #define INPUT_STARVE_TIMEOUT_MS 5000
 #define H264_LATENCY_RESTART_MS 2500
 #define H264_BS_LATENCY_WATER  (512 * 1024)
@@ -336,7 +339,13 @@ try_convert:
 		cvt_rc = ioctl(r->prp_fd, VPU_IOC_PP_CONVERT, &p);
 		if (cvt_rc == 0) {
 			used_pp = 1;
-		} else if (disable_pp_on_fail) {
+		} else if (disable_pp_on_fail &&
+			   errno != ETIME && errno != EIO && errno != EINTR) {
+			/* A timeout / error IRQ is a one-off: the driver resets the
+			 * PP and the next frame converts fine. Disabling PP for good
+			 * on it left the overlay frozen (the PrP fallback is off in
+			 * the driver by default), so only "unsupported mode" style
+			 * errors disable PP; transient ones just drop this frame. */
 			int pp_errno = errno;
 
 			*r->pp_ok = 0;
@@ -2933,6 +2942,7 @@ int main(int argc, char **argv)
 		long h264_dec_fail = 0, h264_ps_short = 0, h264_slice_short = 0;
 		long h264_samples = 0;
 		int pending_idx = -1, pending_display = 0, pp_pipeline_ok = 1;
+		long last_render_ms = now_ms();   /* last good render, or not showing */
 		unsigned int pending_qp_phys = 0;
 		int pp_pipeline_cooldown = 0;
 		long pending_dec_ms = 0;
@@ -3114,6 +3124,7 @@ int main(int argc, char **argv)
 				if (prc == 0) {
 					rendered_pending = 1;
 					pipe_window++;
+					last_render_ms = now_ms();
 				} else {
 					pp_pipeline_ok = 0;
 					pp_pipeline_cooldown = 120;
@@ -3180,11 +3191,12 @@ int main(int argc, char **argv)
 
 			if (pending_idx >= 0) {
 				if (g_output_mode != OUTPUT_DECODE_ONLY &&
-				    pending_display && !rendered_pending)
-					render_frame(&rs, pending_idx, pp_ok,
-						     g_codec != STD_AVC, 1,
-						     &ms_prp, &ms_blit,
-						     &pp_window, &prp_window);
+				    pending_display && !rendered_pending &&
+				    render_frame(&rs, pending_idx, pp_ok,
+						 g_codec != STD_AVC, 1,
+						 &ms_prp, &ms_blit,
+						 &pp_window, &prp_window) == 0)
+					last_render_ms = now_ms();
 				vpu_DecClrDispFlag(h, pending_idx);
 				ms_dec += pending_dec_ms;
 				ms_feed += pending_feed_ms;
@@ -3286,6 +3298,14 @@ int main(int argc, char **argv)
 				}
 			} else {
 				waiting_i_since = 0;
+			}
+			if (!(g_show && g_armed) || g_output_mode == OUTPUT_DECODE_ONLY)
+				last_render_ms = now_ms();
+			else if (now_ms() - last_render_ms > RENDER_FAIL_TIMEOUT_MS) {
+				printf("render watchdog: no frame rendered for %ld ms while shown; reconnecting\n",
+				       now_ms() - last_render_ms);
+				fflush(stdout);
+				break;
 			}
 			if (now_ms() - last_frame_ms > NO_FRAME_TIMEOUT_MS) {
 				printf("decoder watchdog: no display frame for %ld ms; reconnecting\n",

@@ -1067,3 +1067,17 @@ void vpu_semaphore_close(semaphore_t * semap)
 		err_msg("munmap share mem failed\n");
 
 }
+
+/*
+ * vpu_DecRegisterFrameBuffer() calls this on i.MX27 to decide whether to
+ * program the decoder IRAM registers. It was referenced but never defined,
+ * so libvpu did not link without it. Same switch as vpu_stream's
+ * --dec-iram / --no-dec-iram: the VPU_DEC_IRAM environment variable,
+ * enabled when set to anything other than "0". Default: off.
+ */
+int vpu_dec_iram_enabled(void)
+{
+	const char *e = getenv("VPU_DEC_IRAM");
+
+	return e && strcmp(e, "0") != 0;
+}

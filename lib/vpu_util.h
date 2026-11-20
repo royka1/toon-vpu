@@ -278,6 +278,9 @@ void semaphore_post(semaphore_t *semap, int mutex);
 unsigned char semaphore_wait(semaphore_t *semap, int mutex);
 void vpu_semaphore_close(semaphore_t *semap);
 
+/* i.MX27: use the decoder IRAM registers (VPU_DEC_IRAM env, default off) */
+int vpu_dec_iram_enabled(void);
+
 static inline unsigned char LockVpu(semaphore_t *semap)
 {
 	if (!semaphore_wait(semap, API_MUTEX))

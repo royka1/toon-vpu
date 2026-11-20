@@ -255,8 +255,19 @@ int main(int argc, char **argv)
     }
     printf("Video: %dx%d minFB=%d\n", ii.picWidth, ii.picHeight, ii.minFrameBufferCount);
 
-    off_x = (fb_w - (int)ii.picWidth)  / 2;
-    off_y = (fb_h - (int)ii.picHeight) / 2;
+    /* ROT=90|270: the VPU's post-rotator turns a portrait stream into
+     * landscape. The CodaDX6 firmware rejects widths > 720, so a native
+     * 800x480 picture can be sent as 480x800 (turned 90 degrees clockwise)
+     * and played with ROT=90. */
+    int rot = getenv("ROT") ? atoi(getenv("ROT")) : 0;
+    if (rot != 0 && rot != 90 && rot != 270) {
+        fprintf(stderr, "ROT must be 90 or 270\n"); return 1;
+    }
+    int disp_w = rot ? (int)ii.picHeight : (int)ii.picWidth;
+    int disp_h = rot ? (int)ii.picWidth : (int)ii.picHeight;
+    if (rot) printf("rotation %d: output %dx%d\n", rot, disp_w, disp_h);
+    off_x = (fb_w - disp_w) / 2;
+    off_y = (fb_h - disp_h) / 2;
     if (off_x < 0) off_x = 0;
     if (off_y < 0) off_y = 0;
 
@@ -293,13 +304,39 @@ int main(int argc, char **argv)
     vpu_DecUpdateBitstreamBuffer(h, 0);
 
     /* never draw outside the framebuffer */
-    cvt_w = (int)ii.picWidth < fb_w ? (int)ii.picWidth : fb_w;
-    cvt_h = (int)ii.picHeight < fb_h ? (int)ii.picHeight : fb_h;
+    cvt_w = disp_w < fb_w ? disp_w : fb_w;
+    cvt_h = disp_h < fb_h ? disp_h : fb_h;
+
+    /* Rotator output: two buffers, alternated per displayed frame. */
+    vpu_mem_desc rotmem[2];
+    FrameBuffer rotfb[2];
+    int rot_id = 0;
+    int rstride = ALIGN16(disp_w), rh = ALIGN16(disp_h);
+    if (rot) {
+        int k, a = rot;
+        memset(rotmem, 0, sizeof(rotmem));
+        memset(rotfb, 0, sizeof(rotfb));
+        for (k = 0; k < 2; k++) {
+            rotmem[k].size = rstride * rh * 3 / 2;
+            if (IOGetPhyMem(&rotmem[k])) { fprintf(stderr, "rotator buffer alloc fail\n"); return 1; }
+            rotfb[k].strideY = rstride;
+            rotfb[k].strideC = rstride / 2;
+            rotfb[k].bufY  = rotmem[k].phy_addr;
+            rotfb[k].bufCb = rotfb[k].bufY + rstride * rh;
+            rotfb[k].bufCr = rotfb[k].bufCb + rstride * rh / 4;
+        }
+        if (vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &rotfb[0]) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, SET_ROTATOR_STRIDE, &rstride) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, SET_ROTATION_ANGLE, &a) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, ENABLE_ROTATION, 0) != RETCODE_SUCCESS) {
+            fprintf(stderr, "rotator setup failed\n"); return 1;
+        }
+    }
 
     /* RGB565 output buffer for the eMMA PrP (DMA pool, phys + write-combine
      * virt). The PrP converts the decoded YUV here in hardware; we then blit. */
     vpu_mem_desc rgbmem = {0};
-    rgbmem.size = ii.picWidth * ah * 2;
+    rgbmem.size = ALIGN16(disp_w) * ALIGN16(disp_h) * 2;
     if (IOGetPhyMem(&rgbmem) || IOGetVirtMem(&rgbmem) <= 0) {
         fprintf(stderr, "rgb buffer alloc fail\n"); return 1;
     }
@@ -337,6 +374,8 @@ int main(int argc, char **argv)
         gettimeofday(&tframe, NULL);
 
         memset(&dp, 0, sizeof(dp));
+        if (rot)
+            vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &rotfb[rot_id]);
         r = vpu_DecStartOneFrame(h, &dp);
         if (r != RETCODE_SUCCESS) { fprintf(stderr, "StartOneFrame ret %d\n", r); break; }
 
@@ -373,10 +412,18 @@ int main(int argc, char **argv)
              * frame-buffer layout; we blit only the visible picHeight rows. */
             struct vpu_prp_convert cvt;
             memset(&cvt, 0, sizeof(cvt));
-            cvt.src_y      = fbmem[idx].phy_addr;
+            if (rot) {
+                /* the rotated picture went to the buffer given before this frame */
+                cvt.src_y      = rotfb[rot_id].bufY;
+                cvt.src_h      = rh;
+                cvt.src_stride = rstride;
+                rot_id ^= 1;
+            } else {
+                cvt.src_y      = fbmem[idx].phy_addr;
+                cvt.src_h      = ah;
+                cvt.src_stride = stride;
+            }
             cvt.src_w      = cvt_w;
-            cvt.src_h      = ah;
-            cvt.src_stride = stride;
             if (direct_fb) {
                 cvt.dst_rgb    = finfo.smem_start + off_y * fb_stride + off_x * 2;
                 cvt.dst_stride = fb_stride;
@@ -384,7 +431,7 @@ int main(int argc, char **argv)
             } else {
                 cvt.dst_rgb    = rgbmem.phy_addr;
                 cvt.dst_stride = cvt_w * 2;
-                cvt.dst_h      = ah;
+                cvt.dst_h      = ALIGN16(disp_h);
             }
             cvt.dst_w      = cvt_w;
             if (ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &cvt) < 0)

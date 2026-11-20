@@ -141,6 +141,19 @@ struct fb_gwinfo {                 /* mach/mx2fb.h -- field order matters */
 #define OV_KEY_G6   0x3F
 #define OV_KEY_B6   0
 static int g_overlay = 0;
+/* --rotate 90|270: the VPU's post-rotator turns a portrait stream into
+ * landscape. The CodaDX6 firmware rejects widths > 720, so a native 800x480
+ * picture can be sent as 480x800 (turned 90 degrees clockwise) and played with
+ * --rotate 90. Three rotator buffers: with the one-frame-late render, frame N
+ * is still being read while N+1 is rotated into the next one. g_rot_of[] maps
+ * a display index to the buffer holding its rotated picture. */
+#define ROT_BUFS 3
+static int g_rot = 0;
+static vpu_mem_desc g_rotmem[ROT_BUFS];
+static FrameBuffer g_rotfb[ROT_BUFS];
+static int g_rot_w = 0;
+static int g_rot_of[32];
+static int g_rot_stride = 0, g_rot_h = 0;
 static int ov_fd = -1;             /* /dev/fb1 */
 static int ov_gw_on = 0, ov_xpos = 0, ov_ypos = 0;
 static void gw_set(int on)
@@ -292,7 +305,7 @@ static int render_frame(struct render_state *r, int idx, int allow_pp,
 
 	memset(&c, 0, sizeof(c));
 
-	c.src_y = r->fbmem[idx].phy_addr;
+	c.src_y = g_rot ? g_rotfb[g_rot_of[idx]].bufY : r->fbmem[idx].phy_addr;
 	c.src_w = r->src_w;
 	c.src_h = r->aligned_h;
 	c.src_stride = r->stride;
@@ -2174,6 +2187,7 @@ static void print_help(const char *argv0)
 	printf("\n");
 	printf("Codec/options:\n");
 	printf("  --codec mpeg4|h264      Select decoder (default from camera_codec or mpeg4)\n");
+	printf("  --rotate 90|270         VPU post-rotation: send portrait, e.g. 480x800 -> 800x480\n");
 	printf("  --rect X Y W H          Output rectangle on fb0 (default: centred 1:1)\n");
 	printf("  --warm                  Decode continuously, show only after SIGUSR1\n");
 	printf("  --prebuffer KB          Poll-wait for data when bitstream buffer below threshold\n");
@@ -2415,6 +2429,12 @@ int main(int argc, char **argv)
 			g_armed = 0;
 		} else if (!strcmp(argv[ai], "--overlay")) {
 			g_overlay = 1;
+		} else if (!strcmp(argv[ai], "--rotate") && ai + 1 < argc) {
+			g_rot = atoi(argv[++ai]);
+			if (g_rot != 90 && g_rot != 270) {
+				fprintf(stderr, "--rotate takes 90 or 270\n");
+				return 1;
+			}
 		} else if (argv[ai][0] != '-') {
 			port = atoi(argv[ai]);
 		} else {
@@ -2802,6 +2822,11 @@ int main(int argc, char **argv)
 			src_visible_w = ii.picCropRect.right;
 			src_visible_h = ii.picCropRect.bottom;
 		}
+		if (g_rot) {
+			int t = src_visible_w;
+			src_visible_w = src_visible_h;
+			src_visible_h = t;
+		}
 	int orig_w = has_rect ? rect_w : 0;
 		int orig_h = has_rect ? rect_h : 0;
 		int out_w = has_rect ? rect_w : src_visible_w;
@@ -2929,6 +2954,33 @@ int main(int argc, char **argv)
 		if (vpu_DecRegisterFrameBuffer(h, fb, fbcount, stride, &binfo) != RETCODE_SUCCESS) {
 			dec_close_guarded(h); close(sock); continue;
 		}
+		if (g_rot) {
+			int k, a = g_rot, rs_ = (int)((ii.picHeight + 15) & ~15);
+			int rh_ = (int)((ii.picWidth + 15) & ~15);
+			RetCode e1, e2, e3, e4;
+			if (!g_rotmem[0].phy_addr) {
+				for (k = 0; k < ROT_BUFS; k++) {
+					g_rotmem[k].size = rs_ * rh_ * 3 / 2;
+					if (IOGetPhyMem(&g_rotmem[k])) { fprintf(stderr, "rot buf alloc\n"); return 1; }
+					g_rotfb[k].strideY = rs_;
+					g_rotfb[k].strideC = rs_ / 2;
+					g_rotfb[k].bufY  = g_rotmem[k].phy_addr;
+					g_rotfb[k].bufCb = g_rotfb[k].bufY + rs_ * rh_;
+					g_rotfb[k].bufCr = g_rotfb[k].bufCb + rs_ * rh_ / 4;
+				}
+				g_rot_stride = rs_; g_rot_h = rh_;
+			} else if (rs_ != g_rot_stride || rh_ != g_rot_h) {
+				fprintf(stderr, "rotator: size changed, restarting\n");
+				return 1;
+			}
+			g_rot_w = 0;
+			e1 = vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &g_rotfb[0]);
+			e2 = vpu_DecGiveCommand(h, SET_ROTATOR_STRIDE, &rs_);
+			e3 = vpu_DecGiveCommand(h, SET_ROTATION_ANGLE, &a);
+			e4 = vpu_DecGiveCommand(h, ENABLE_ROTATION, 0);
+			printf("rotator: %d deg, %dx%d, rc %d %d %d %d\n", g_rot, rs_, rh_, e1, e2, e3, e4);
+			if (e1 || e2 || e3 || e4) { dec_close_guarded(h); close(sock); continue; }
+		}
 		if (g_output_mode == OUTPUT_FB && !g_overlay)
 			memset(fb_map, 0, fb_stride * fb_h);
 		else if (g_overlay)
@@ -2966,8 +3018,8 @@ int main(int argc, char **argv)
 		rs.rgbmem = &rgbmem;
 		rs.src_w = src_visible_w;
 		rs.src_h = src_visible_h;
-		rs.aligned_h = ah;
-		rs.stride = stride;
+		rs.aligned_h = g_rot ? (unsigned)g_rot_h : (unsigned)ah;
+		rs.stride = g_rot ? g_rot_stride : stride;
 		rs.fb_bpp = fb_bpp;
 		rs.fb_stride = fb_stride;
 		rs.fb_phys = fb_phys;
@@ -3116,11 +3168,15 @@ int main(int argc, char **argv)
 			}
 			memset(&dp, 0, sizeof(dp));
 			td0 = now_ms();
+			if (g_rot)
+				vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &g_rotfb[g_rot_w]);
 			if (vpu_DecStartOneFrame(h, &dp) != RETCODE_SUCCESS) break;
 			td1 = now_ms();
 
 			if (g_output_mode != OUTPUT_DECODE_ONLY &&
-			    g_codec != STD_AVC &&
+			    /* H.264 renders sequentially (decoded pictures may be live references),
+			     * except with --rotate: then PP reads our rotator buffer. */
+			    (g_codec != STD_AVC || g_rot) &&
 			    pending_idx >= 0 && pending_display && pp_ok && pp_pipeline_ok) {
 				rs.qp_phys = pending_qp_phys;
 				int prc = render_frame(&rs, pending_idx, 1, 0, 0,
@@ -3166,6 +3222,10 @@ int main(int argc, char **argv)
 			ti0 = now_ms();
 			if (vpu_DecGetOutputInfo(h, &oi) != RETCODE_SUCCESS) break;
 			ti1 = now_ms();
+			if (g_rot && oi.indexFrameDisplay >= 0 && oi.indexFrameDisplay < 32) {
+				g_rot_of[oi.indexFrameDisplay] = g_rot_w;
+				g_rot_w = (g_rot_w + 1) % ROT_BUFS;
+			}
 			vpu_ms_this = (td1 - td0) + (tw1 - tw0) + (ti1 - ti0);
 			wait_ms_this = tw1 - tw0;
 			long t1 = now_ms();

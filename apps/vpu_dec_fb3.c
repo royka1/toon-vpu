@@ -27,6 +27,13 @@
 struct vpu_prp_convert {
     unsigned int src_y, src_w, src_h, src_stride;
     unsigned int dst_rgb, dst_w, dst_h, dst_stride;
+    /* Same layout as in vpu_stream.c / the prebuilt mxc_vpu.ko, which copies
+     * the whole struct from userspace. Without these two fields the driver
+     * read whatever followed on the stack: H.264 frames came out as raw YUV
+     * planes (non-zero in_fmt = RGB input, colour conversion bypassed).
+     * Both are left 0 here (YUV420 in, RGB565 out). */
+    unsigned int dst_bpp;
+    unsigned int in_fmt;
 };
 #define VPU_IOC_PRP_CONVERT  _IO('V', 22)
 
@@ -136,6 +143,8 @@ int main(int argc, char **argv)
     /* Framebuffer */
     int fb_fd;
     struct fb_var_screeninfo vinfo, vinfo_orig, vinfo_new;
+    struct fb_fix_screeninfo finfo;
+    int direct_fb = 0;
     unsigned char *fb_map;
     size_t fb_size;
     int fb_stride, off_x, off_y, fb_w, fb_h;
@@ -184,6 +193,14 @@ int main(int argc, char **argv)
     fb_w = vinfo.xres; fb_h = vinfo.yres;
     fb_bpp = vinfo.bits_per_pixel;
     fb_stride = vinfo.xres * (fb_bpp / 8);
+    /* Let the eMMA PrP write RGB565 straight into the 16 bpp framebuffer
+     * instead of into a DMA buffer that the CPU then copies out of (an
+     * uncached read: ~77 ms per 720x400 frame, capping playback at ~10 fps).
+     * NO_DIRECT_FB=1 selects the old copy path. */
+    if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &finfo) == 0 && fb_bpp == 16 &&
+        !getenv("NO_DIRECT_FB"))
+        direct_fb = 1;
+    printf("PrP output: %s\n", direct_fb ? "direct to fb" : "via copy");
     fb_size = fb_stride * vinfo.yres;
     fb_map = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (fb_map == MAP_FAILED) { perror("mmap fb"); return 1; }
@@ -232,13 +249,25 @@ int main(int argc, char **argv)
     r = vpu_DecGetInitialInfo(h, &ii);
     vpu_DecSetEscSeqInit(h, 0);
     if (r != RETCODE_SUCCESS) {
-        fprintf(stderr, "InitialInfo FAILED: %d\n", r, ii.errorcode);
+        fprintf(stderr, "InitialInfo FAILED: %d (errorcode 0x%lx)\n", r,
+                (unsigned long)ii.errorcode);
         vpu_DecClose(h); vpu_UnInit(); return 1;
     }
     printf("Video: %dx%d minFB=%d\n", ii.picWidth, ii.picHeight, ii.minFrameBufferCount);
 
-    off_x = (fb_w - (int)ii.picWidth)  / 2;
-    off_y = (fb_h - (int)ii.picHeight) / 2;
+    /* ROT=90|270: the VPU's post-rotator turns a portrait stream into
+     * landscape. The CodaDX6 firmware rejects widths > 720, so a native
+     * 800x480 picture can be sent as 480x800 (turned 90 degrees clockwise)
+     * and played with ROT=90. */
+    int rot = getenv("ROT") ? atoi(getenv("ROT")) : 0;
+    if (rot != 0 && rot != 90 && rot != 270) {
+        fprintf(stderr, "ROT must be 90 or 270\n"); return 1;
+    }
+    int disp_w = rot ? (int)ii.picHeight : (int)ii.picWidth;
+    int disp_h = rot ? (int)ii.picWidth : (int)ii.picHeight;
+    if (rot) printf("rotation %d: output %dx%d\n", rot, disp_w, disp_h);
+    off_x = (fb_w - disp_w) / 2;
+    off_y = (fb_h - disp_h) / 2;
     if (off_x < 0) off_x = 0;
     if (off_y < 0) off_y = 0;
 
@@ -274,13 +303,40 @@ int main(int argc, char **argv)
 
     vpu_DecUpdateBitstreamBuffer(h, 0);
 
-    cvt_w = ii.picWidth;
-    cvt_h = ii.picHeight;
+    /* never draw outside the framebuffer */
+    cvt_w = disp_w < fb_w ? disp_w : fb_w;
+    cvt_h = disp_h < fb_h ? disp_h : fb_h;
+
+    /* Rotator output: two buffers, alternated per displayed frame. */
+    vpu_mem_desc rotmem[2];
+    FrameBuffer rotfb[2];
+    int rot_id = 0;
+    int rstride = ALIGN16(disp_w), rh = ALIGN16(disp_h);
+    if (rot) {
+        int k, a = rot;
+        memset(rotmem, 0, sizeof(rotmem));
+        memset(rotfb, 0, sizeof(rotfb));
+        for (k = 0; k < 2; k++) {
+            rotmem[k].size = rstride * rh * 3 / 2;
+            if (IOGetPhyMem(&rotmem[k])) { fprintf(stderr, "rotator buffer alloc fail\n"); return 1; }
+            rotfb[k].strideY = rstride;
+            rotfb[k].strideC = rstride / 2;
+            rotfb[k].bufY  = rotmem[k].phy_addr;
+            rotfb[k].bufCb = rotfb[k].bufY + rstride * rh;
+            rotfb[k].bufCr = rotfb[k].bufCb + rstride * rh / 4;
+        }
+        if (vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &rotfb[0]) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, SET_ROTATOR_STRIDE, &rstride) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, SET_ROTATION_ANGLE, &a) != RETCODE_SUCCESS ||
+            vpu_DecGiveCommand(h, ENABLE_ROTATION, 0) != RETCODE_SUCCESS) {
+            fprintf(stderr, "rotator setup failed\n"); return 1;
+        }
+    }
 
     /* RGB565 output buffer for the eMMA PrP (DMA pool, phys + write-combine
      * virt). The PrP converts the decoded YUV here in hardware; we then blit. */
     vpu_mem_desc rgbmem = {0};
-    rgbmem.size = ii.picWidth * ah * 2;
+    rgbmem.size = ALIGN16(disp_w) * ALIGN16(disp_h) * 2;
     if (IOGetPhyMem(&rgbmem) || IOGetVirtMem(&rgbmem) <= 0) {
         fprintf(stderr, "rgb buffer alloc fail\n"); return 1;
     }
@@ -290,14 +346,14 @@ int main(int argc, char **argv)
     /* Clear border to black once */
     if (off_x > 0 || off_y > 0) {
         if (off_y > 0) memset(fb_map, 0, off_y * fb_stride);
-        if (off_y + (int)ii.picHeight < fb_h)
-            memset(fb_map + (off_y + ii.picHeight) * fb_stride, 0,
-                   (fb_h - off_y - ii.picHeight) * fb_stride);
-        for (i = off_y; i < off_y + (int)ii.picHeight; i++) {
+        if (off_y + cvt_h < fb_h)
+            memset(fb_map + (off_y + cvt_h) * fb_stride, 0,
+                   (fb_h - off_y - cvt_h) * fb_stride);
+        for (i = off_y; i < off_y + cvt_h; i++) {
             if (off_x > 0) memset(fb_map + i * fb_stride, 0, off_x * 2);
-            if (off_x + (int)ii.picWidth < fb_w)
-                memset(fb_map + i * fb_stride + (off_x + ii.picWidth) * 2,
-                       0, (fb_w - off_x - ii.picWidth) * 2);
+            if (off_x + cvt_w < fb_w)
+                memset(fb_map + i * fb_stride + (off_x + cvt_w) * 2,
+                       0, (fb_w - off_x - cvt_w) * 2);
         }
     }
 
@@ -318,15 +374,30 @@ int main(int argc, char **argv)
         gettimeofday(&tframe, NULL);
 
         memset(&dp, 0, sizeof(dp));
+        if (rot)
+            vpu_DecGiveCommand(h, SET_ROTATOR_OUTPUT, &rotfb[rot_id]);
         r = vpu_DecStartOneFrame(h, &dp);
         if (r != RETCODE_SUCCESS) { fprintf(stderr, "StartOneFrame ret %d\n", r); break; }
 
         i = 0;
-        while (vpu_IsBusy()) { vpu_WaitForInt(50); if (++i > 30) break; }
+        /* Wait up to 10 s. Reading the output registers of an unfinished
+         * picture returns stale values: RET_DEC_SEQ_SRC_SIZE (w << 10 | h)
+         * then came back as the display index and fbmem[] was indexed with
+         * it (the "AVC segfault"). */
+        while (vpu_IsBusy()) { vpu_WaitForInt(50); if (++i > 200) break; }
+        if (vpu_IsBusy()) {
+            fprintf(stderr, "VPU still busy after %d ms; stopping\n", i * 50);
+            break;
+        }
 
         memset(&oi, 0, sizeof(oi));
         r = vpu_DecGetOutputInfo(h, &oi);
         if (r != RETCODE_SUCCESS) { fprintf(stderr, "GetOutputInfo ret %d\n", r); break; }
+        if (oi.indexFrameDisplay >= fbcount || oi.indexFrameDecoded >= fbcount) {
+            fprintf(stderr, "bad frame index (dec %d, disp %d, fbcount %d); stopping\n",
+                    oi.indexFrameDecoded, oi.indexFrameDisplay, fbcount);
+            break;
+        }
 
         gettimeofday(&tafter_decode, NULL);
 
@@ -340,24 +411,40 @@ int main(int argc, char **argv)
              * src_h = padded height so the chroma plane offset matches the VPU
              * frame-buffer layout; we blit only the visible picHeight rows. */
             struct vpu_prp_convert cvt;
-            cvt.src_y      = fbmem[idx].phy_addr;
-            cvt.src_w      = ii.picWidth;
-            cvt.src_h      = ah;
-            cvt.src_stride = stride;
-            cvt.dst_rgb    = rgbmem.phy_addr;
-            cvt.dst_w      = ii.picWidth;
-            cvt.dst_h      = ah;
-            cvt.dst_stride = ii.picWidth * 2;
+            memset(&cvt, 0, sizeof(cvt));
+            if (rot) {
+                /* the rotated picture went to the buffer given before this frame */
+                cvt.src_y      = rotfb[rot_id].bufY;
+                cvt.src_h      = rh;
+                cvt.src_stride = rstride;
+                rot_id ^= 1;
+            } else {
+                cvt.src_y      = fbmem[idx].phy_addr;
+                cvt.src_h      = ah;
+                cvt.src_stride = stride;
+            }
+            cvt.src_w      = cvt_w;
+            if (direct_fb) {
+                cvt.dst_rgb    = finfo.smem_start + off_y * fb_stride + off_x * 2;
+                cvt.dst_stride = fb_stride;
+                cvt.dst_h      = cvt_h;   /* visible rows only: stay inside the fb */
+            } else {
+                cvt.dst_rgb    = rgbmem.phy_addr;
+                cvt.dst_stride = cvt_w * 2;
+                cvt.dst_h      = ALIGN16(disp_h);
+            }
+            cvt.dst_w      = cvt_w;
             if (ioctl(prp_fd, VPU_IOC_PRP_CONVERT, &cvt) < 0)
                 fprintf(stderr, "PRP_CONVERT failed\n");
 
             gettimeofday(&tafter_copy, NULL);  /* after HW CSC */
 
             /* Stage B: blit the visible rows from the RGB buffer to the fb */
-            for (i = 0; i < cvt_h; i++)
-                memcpy(fb_map + off_y * fb_stride + off_x * (fb_bpp / 8) + i * fb_stride,
-                       (unsigned char *)rgbmem.virt_uaddr + i * blit_bytes,
-                       blit_bytes);
+            if (!direct_fb)
+                for (i = 0; i < cvt_h; i++)
+                    memcpy(fb_map + off_y * fb_stride + off_x * (fb_bpp / 8) + i * fb_stride,
+                           (unsigned char *)rgbmem.virt_uaddr + i * blit_bytes,
+                           blit_bytes);
 
             gettimeofday(&tafter_conv, NULL);
             vpu_DecClrDispFlag(h, idx);

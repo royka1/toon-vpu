@@ -1052,7 +1052,27 @@ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
 
 	ts.tv_sec = time(NULL) + mutex_timeout;
 	ts.tv_nsec = 0;
+#ifdef __UCLIBC__
+	/* uClibc's linuxthreads suspends a contended timedlock waiter via
+	 * __sigsetjmp, which in some uClibc builds saves VFP registers
+	 * (fstmiax): SIGILL on the FPU-less i.MX27. Its waiter queue can't
+	 * work across processes either, and this mutex lives in shared
+	 * memory. Poll with trylock instead. */
+	(void)ts;
+	{
+		time_t end = time(NULL) + mutex_timeout;
+
+		while ((ret = pthread_mutex_trylock(m)) == EBUSY) {
+			if (time(NULL) > end) {
+				ret = ETIMEDOUT;
+				break;
+			}
+			usleep(1000);
+		}
+	}
+#else
 	ret = pthread_mutex_timedlock(m, &ts);
+#endif
 	if (ret == ETIMEDOUT) {
 		warn_msg("VPU mutex couldn't be locked before timeout expired\n");
 		return false;
@@ -1066,4 +1086,18 @@ void vpu_semaphore_close(semaphore_t * semap)
 	if (munmap((void *)semap, sizeof(semaphore_t)) != 0)
 		err_msg("munmap share mem failed\n");
 
+}
+
+/*
+ * vpu_DecRegisterFrameBuffer() calls this on i.MX27 to decide whether to
+ * program the decoder IRAM registers. It was referenced but never defined,
+ * so libvpu did not link without it. Same switch as vpu_stream's
+ * --dec-iram / --no-dec-iram: the VPU_DEC_IRAM environment variable,
+ * enabled when set to anything other than "0". Default: off.
+ */
+int vpu_dec_iram_enabled(void)
+{
+	const char *e = getenv("VPU_DEC_IRAM");
+
+	return e && strcmp(e, "0") != 0;
 }

@@ -335,8 +335,13 @@
 
 #if defined(IMX27ADS)
 	#define CODE_BUF_SIZE			(64 * 1024)
-	#define FMO_SLICE_SAVE_BUF_SIZE		(0)  /* reduced: no FMO for 480p MPEG-4 */
-	#define WORK_BUF_SIZE			(128 * 1024)  /* reduced to fit max DMA block */
+	/* Freescale's i.MX27 sizes. 128 KB is enough for MPEG-4 but not for
+	 * H.264: the CodaDX6 then writes past the work buffer into the firmware
+	 * code buffer that follows it and hangs on the first picture. The
+	 * driver allocates this once per module lifetime, so a size change
+	 * needs a reboot. */
+	#define FMO_SLICE_SAVE_BUF_SIZE		(32)
+	#define WORK_BUF_SIZE			((288 * 1024) + (FMO_SLICE_SAVE_BUF_SIZE * 1024 * 8))
 	#define PARA_BUF2_SIZE			(1728)
 	#define PARA_BUF_SIZE			(10 * 1024)
 #elif defined(IMX31ADS)

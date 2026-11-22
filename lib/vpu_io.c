@@ -121,14 +121,16 @@ int set_iram(struct iram_t iram, Uint32 array[][NR_ENTRY], int array_size)
 {
 	int i, j, offset;
 	int use_iram_bits;
+	Uint32 axi_sram_use_reg = cpu_is_mx27() ? 0x140 : BIT_AXI_SRAM_USE;
 
 	use_iram_bits = array[USE_OVL_INTERNAL_BUF][2] << 3 |
 			array[USE_DBK_INTERNAL_BUF][2] << 2 |
 			array[USE_IP_INTERNAL_BUF][2] << 1 |
 			array[USE_BIT_INTERNAL_BUF][2];
 	IOClkGateSet(true);
-	VpuWriteReg(BIT_AXI_SRAM_USE, use_iram_bits);
-	dprintf(3, "use iram_bits:%08x\n", use_iram_bits);
+	VpuWriteReg(axi_sram_use_reg, use_iram_bits);
+	dprintf(3, "use iram_bits:%08x reg:%08lx\n",
+		use_iram_bits, (unsigned long)axi_sram_use_reg);
 
 	for (i = 0; i < array_size; i++) {
 		offset = 0;
@@ -333,7 +335,7 @@ void vpu_setting_iram()
 	struct iram_t iram;
 	int ret;
 
-	if (cpu_is_mx37()) {
+	if (cpu_is_mx37() || (cpu_is_mx27() && vpu_dec_iram_enabled())) {
 		IOGetIramBase(&iram);
 		ret = get_iram_setting(iram, use_iram_table, 4);
 		if (ret != -1)
